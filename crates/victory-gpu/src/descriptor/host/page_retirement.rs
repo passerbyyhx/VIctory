@@ -3,6 +3,7 @@
 //! their normal layout, and the sampled textures live through every submission.
 
 mod colors;
+mod translated_reads;
 
 use super::{HostHeap, PAGE, view_pages};
 use crate::host::test_submission::while_pending;
