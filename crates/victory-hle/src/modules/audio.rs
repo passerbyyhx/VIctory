@@ -705,6 +705,10 @@ fn dump_input(index: u32, context: Context) {
 /// Starts the decoding thread on the first enabled voice, and has it fill
 /// rings now: a voice just enabled or read from.
 fn wake_decoder() {
+    #[cfg(test)]
+    if voice_bench::manual_pump() {
+        return;
+    }
     static DECODER: OnceLock<std::thread::Thread> = OnceLock::new();
     DECODER
         .get_or_init(|| {
@@ -1448,3 +1452,6 @@ mod tests {
         assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
     }
 }
+
+#[cfg(test)]
+mod voice_bench;
