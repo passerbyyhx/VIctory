@@ -1325,6 +1325,8 @@ pub enum View<'a> {
     TypedUav(DXGI_FORMAT, u32, u32),
     /// A structured buffer UAV of this many elements of this many bytes, zeroed.
     StructuredUav(u32, u32),
+    /// A structured buffer UAV with explicit initial contents.
+    StructuredUavSeeded(&'a [u32], u32),
     /// A constant buffer of these dwords.
     Cbv(&'a [u32]),
     /// A buffer SRV over these dwords.
@@ -1363,7 +1365,9 @@ pub fn view_strides(views: &[View]) -> Vec<u32> {
         .map(|v| match *v {
             View::Buffer { stride: Stride::Raw, .. } | View::RawUav(_) => 4,
             View::Buffer { stride: Stride::Typed, .. } => 16,
-            View::Buffer { stride: Stride::Structured(n), .. } | View::StructuredUav(_, n) => n,
+            View::Buffer { stride: Stride::Structured(n), .. }
+            | View::StructuredUav(_, n)
+            | View::StructuredUavSeeded(_, n) => n,
             View::Buffer { stride: Stride::Format(f, n), .. } | View::TypedUav(f, _, n) => n | kind(f),
             View::HalfUav(_) => 8,
             _ => 0,
@@ -1687,7 +1691,8 @@ impl Host {
                     View::RawUav(_)
                     | View::HalfUav(_)
                     | View::TypedUav(..)
-                    | View::StructuredUav(..) => {
+                    | View::StructuredUav(..)
+                    | View::StructuredUavSeeded(..) => {
                         // (dwords, format, elements, stride, flags)
                         let (n, format, elements, stride, flags) = match *v {
                             View::HalfUav(e) => (
@@ -1711,13 +1716,24 @@ impl Host {
                                 stride,
                                 D3D12_BUFFER_UAV_FLAG_NONE,
                             ),
-                            View::RawUav(n) => (
-                                n,
-                                DXGI_FORMAT_R32_TYPELESS,
-                                n,
-                                0,
-                                D3D12_BUFFER_UAV_FLAG_RAW,
-                            ),
+                            View::StructuredUavSeeded(data, stride) => {
+                                let n = u32::try_from(data.len()).map_err(|e| e.to_string())?;
+                                if stride < 4 || stride % 4 != 0 || n % (stride / 4) != 0 {
+                                    return Err(
+                                        "initial words do not fill structured elements".into()
+                                    );
+                                }
+                                (
+                                    n,
+                                    DXGI_FORMAT_UNKNOWN,
+                                    n / (stride / 4),
+                                    stride,
+                                    D3D12_BUFFER_UAV_FLAG_NONE,
+                                )
+                            }
+                            View::RawUav(n) => {
+                                (n, DXGI_FORMAT_R32_TYPELESS, n, 0, D3D12_BUFFER_UAV_FLAG_RAW)
+                            }
                             _ => unreachable!(),
                         };
                         let bytes = u64::from(n) * 4;
@@ -1739,7 +1755,18 @@ impl Host {
                             },
                         };
                         dev.CreateUnorderedAccessView(&b, None, Some(&desc), at);
-                        keep.push(zero(&b, None, n)?);
+                        if let View::StructuredUavSeeded(data, _) = *v {
+                            let initial = upload(data)?;
+                            list.CopyBufferRegion(&b, 0, &initial, 0, bytes);
+                            list.ResourceBarrier(&[transition(
+                                &b,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            )]);
+                            keep.push(initial);
+                        } else {
+                            keep.push(zero(&b, None, n)?);
+                        }
                         let rb = make(
                             D3D12_HEAP_TYPE_READBACK,
                             &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),

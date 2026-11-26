@@ -994,3 +994,159 @@ fn indexed_subword_buffer_stores_write_structured_uav_and_drop_oob() {
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
+
+/// Four lanes per full word, or two lanes per sparse word, write disjoint
+/// byte fields with a single indexed store instruction.
+#[test]
+#[ignore = "run standalone with both adapters and the D3D12 Debug Layer"]
+fn indexed_byte_store_shares_dwords_between_lanes() {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_MESSAGE, D3D12_MESSAGE_SEVERITY_ERROR, D3D12GetDebugInterface, ID3D12Debug,
+        ID3D12InfoQueue,
+    };
+    use windows::Win32::Graphics::Dxgi::{
+        CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1,
+        IDXGIFactory4,
+    };
+    use windows::core::Interface;
+
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // SAFETY: the debug interface is acquired and enabled before devices are created.
+    unsafe {
+        let mut debug: Option<ID3D12Debug> = None;
+        D3D12GetDebugInterface(&mut debug).expect("D3D12 Debug Layer");
+        debug.unwrap().EnableDebugLayer();
+    }
+
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let host = Host::new(warp).unwrap_or_else(|e| panic!("{label}: {e}"));
+        // SAFETY: DXGI queries use the LUID returned by this live D3D12 device.
+        let (desc, name, queue) = unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let adapter: IDXGIAdapter1 = factory
+                .EnumAdapterByLuid(host.device.GetAdapterLuid())
+                .unwrap();
+            let desc = adapter.GetDesc1().unwrap();
+            let end = desc
+                .Description
+                .iter()
+                .position(|&u| u == 0)
+                .unwrap_or(desc.Description.len());
+            let name = String::from_utf16_lossy(&desc.Description[..end]);
+            let queue = host
+                .device
+                .cast::<ID3D12InfoQueue>()
+                .expect("debug InfoQueue");
+            (desc, name, queue)
+        };
+        let software = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
+        assert_eq!(software, warp, "{label}: {name}");
+        eprintln!(
+            "adapter={label} name={name:?} vendor={:04x} device={:04x} luid={:08x}:{:08x} software={software}",
+            desc.VendorId, desc.DeviceId, desc.AdapterLuid.HighPart, desc.AdapterLuid.LowPart
+        );
+
+        for (case, shift, step) in [("full", 2u32, 1u32), ("sparse", 1, 2)] {
+            let code = [
+                0xBE84_0300,
+                0xBE85_0380,
+                0xF408_0202,
+                0xFA00_0000, // UAV V# in s[8:11]
+                0xBE86_0301,
+                0xBE87_0380,
+                0xF408_0303,
+                0xFA00_0000,                      // SRV V# in s[12:15]
+                0x3406_0082,                      // v_lshlrev_b32 v3, 2, v0 (source address)
+                0x2C08_0080 | shift,              // v_lshrrev_b32 v4, shift, v0
+                0x4A08_0881,                      // v_add_nc_u32 v4, 1, v4 (destination record)
+                0x360A_0080 | ((1 << shift) - 1), // v_and_b32 v5, (1<<shift)-1, v0
+                0x340A_0A80 | (step - 1),         // v_lshlrev_b32 v5, log2(step), v5
+                0xBF8C_C07F,                      // s_waitcnt lgkmcnt(0)
+                0xE030_1000,
+                0x8003_0103, // buffer_load_dword v1, v3, s[12:15], 0 offen
+                0xBF8C_3F70, // s_waitcnt vmcnt(0)
+                0xE060_3004,
+                0x8002_0104, // buffer_store_byte v1, v[4:5], s[8:11], 0 idxen offen offset:4
+                0xBF81_0000, // s_endpgm
+            ];
+            let mut uav = entry(ResourceType::Uav, 4, 0);
+            uav.stride = 12;
+            let shader = build(
+                &code,
+                vec![param(RootType::Table, 0), param(RootType::Table, 1)],
+                vec![uav, entry(ResourceType::Srv, 4, 1)],
+                32,
+            );
+            // SAFETY: the info queue belongs to this live device.
+            let before = unsafe { queue.GetNumStoredMessages() };
+            let (root, pso) = host.compute_pipeline(&shader).unwrap();
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = 32 * u32::from(u.slot);
+            }
+            let records = (32 >> shift) + 2;
+            let seed: Vec<u32> = (0..records)
+                .flat_map(|r| [0xA1B2_C300 + r, 0xD4E5_F600 + r, 0x71A2_D300 + r])
+                .collect();
+            let input: Vec<u32> = (0..32).map(|l| 0x9182_7310 + l).collect();
+            let views = [
+                View::StructuredUavSeeded(&seed, 12),
+                View::Buffer {
+                    data: &input,
+                    stride: Stride::Raw,
+                },
+            ];
+            let mut want = seed.clone();
+            for (lane, &value) in input.iter().enumerate() {
+                let record = (lane >> shift) + 1;
+                let pos = (lane % (1 << shift)) * step as usize * 8;
+                let target = &mut want[record * 3 + 1];
+                *target = (*target & !(0xff << pos)) | ((value & 0xff) << pos);
+            }
+            for rep in 0..8 {
+                let words = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(ud.clone()))],
+                            views: &views,
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{label} {case} {rep}: {e}"));
+                if rep == 0 || words[0] != want {
+                    eprintln!("{label} case={case} rep={rep} seed={seed:08x?}");
+                    eprintln!(
+                        "{label} case={case} rep={rep} want={want:08x?} got={:08x?}",
+                        words[0]
+                    );
+                }
+                assert_eq!(words[0], want, "{label} {case} {rep}");
+            }
+            // SAFETY: each message is fetched into aligned storage of the reported size.
+            unsafe {
+                let after = queue.GetNumStoredMessages();
+                let mut errors = 0;
+                for i in before..after {
+                    let mut size = 0;
+                    queue.GetMessage(i, None, &mut size).unwrap();
+                    let mut storage = vec![0u64; size.div_ceil(8)];
+                    let msg = storage.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                    queue.GetMessage(i, Some(msg), &mut size).unwrap();
+                    let msg = &*msg;
+                    let bytes = std::slice::from_raw_parts(msg.pDescription, msg.DescriptionByteLength);
+                    eprintln!("{label} debug id={} severity={} {}", msg.ID.0, msg.Severity.0,
+                        String::from_utf8_lossy(bytes).trim_end_matches('\0'));
+                    errors += usize::from(msg.Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0);
+                }
+                eprintln!("{label} case={case} matched=8/8 debug_messages={before}->{after} errors={errors}");
+                assert_eq!(errors, 0, "{label} {case}: new D3D12 debug errors");
+                host.device.GetDeviceRemovedReason().expect("device healthy");
+            }
+        }
+    }
+}
