@@ -56,8 +56,9 @@ fn report_adapter(host: &Host) {
         .position(|&c| c == 0)
         .unwrap_or(desc.Description.len());
     eprintln!(
-        "D3D12 adapter: {}",
-        String::from_utf16_lossy(&desc.Description[..length])
+        "D3D12 adapter: {} ({:04x}:{:04x}) LUID={:08x}:{:08x}",
+        String::from_utf16_lossy(&desc.Description[..length]),
+        desc.VendorId, desc.DeviceId, desc.AdapterLuid.HighPart, desc.AdapterLuid.LowPart
     );
 }
 

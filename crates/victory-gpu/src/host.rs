@@ -777,6 +777,9 @@ pub(crate) mod tests {
         assert!(!crate::shadow::take_reads().contains(&memory), "forgotten: its mark cleared");
         crate::shadow::tests::mark_read(true, memory);
         assert!(crate::shadow::take_reads().contains(&memory), "read again after it was forgotten");
+        // SAFETY: the test's D3D12 device is live.
+        let luid = unsafe { host.device.GetAdapterLuid() };
+        eprintln!("read-mark assertions reached end: plain={plain} memory={memory} dynamic={dynamic} outside={past} LUID={:08x}:{:08x}", luid.HighPart, luid.LowPart);
     }
 
     /// Paged view heaps: a page no shader used lately is taken back where
@@ -845,6 +848,9 @@ pub(crate) mod tests {
         crate::shadow::tests::mark_read(false, slot);
         crate::descriptor::make_read(&crate::shadow::take_reads());
         assert!(heap_host.kept(slot), "its texture made");
+        // SAFETY: the test's D3D12 device is live.
+        let luid = unsafe { host.device.GetAdapterLuid() };
+        eprintln!("restoration assertions reached end: slot={slot} first_page={placed} second_page={again} LUID={:08x}:{:08x}", luid.HighPart, luid.LowPart);
     }
 
     /// The textures shaders read through the heap since the last eviction
