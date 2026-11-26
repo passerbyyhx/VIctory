@@ -1254,6 +1254,9 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         let syncing = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncHeapsUs);
         crate::descriptor::sync_heaps();
+        if crate::descriptor::host::view_pages() {
+            crate::shadow::begin_paged_reads();
+        }
         #[cfg(feature = "diagnostics")]
         drop(syncing);
         // Textures heap-indexing shaders may read, uploaded first by a list
@@ -1486,14 +1489,17 @@ impl Host {
             .map(|(s, a, n, _)| (s.clone(), *a, *n))
             .collect();
         crate::shadow::copy_back_marks(&withheld, withholding);
-        // Texture views left null that shaders read: made for what follows.
+        // Snapshot this submission's texture reads before page restoration
+        // re-arms the lazy slots on an entire page.
         let read = crate::shadow::take_reads();
-        if !read.is_empty() {
-            crate::descriptor::make_read(&read);
-        }
         // Paged view heaps: pages read are kept (placed again if taken back),
         // pages unused lately taken back where room runs low.
         crate::descriptor::turn_pages(&crate::shadow::take_page_reads(), std::time::Instant::now());
+        // Newly restored pages have physical slots now. Make only the
+        // placed textures this submission actually read.
+        if !read.is_empty() {
+            crate::descriptor::make_read(&read);
+        }
         for (shadow, address, len, goes_back) in &back {
             let (address, len) = (*address, *len);
             if *goes_back {

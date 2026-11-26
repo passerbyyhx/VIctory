@@ -283,7 +283,10 @@ pub(crate) fn make_read(slots: &[u32]) {
             .map(|&(_, _, at)| unsafe { &*(at as *const Heap) })
             .filter(|heap| heap.desc.kind == VIEWS_KIND)
             .filter_map(|heap| heap.host.get()?.as_ref().map(|host| (heap, host)))
-            .flat_map(|(heap, host)| slots.iter().filter(|&&i| i < heap.desc.count).filter_map(|&i| host.unmade_placed(i)))
+            .flat_map(|(heap, host)| {
+                slots.iter().copied().filter(|&i| i < heap.desc.count)
+                    .filter_map(|i| host.unmade_placed(i).filter(|_| host.has_read_slot(i)))
+            })
             .collect()
     };
     #[cfg(test)]
@@ -304,6 +307,12 @@ pub(crate) fn make_read(slots: &[u32]) {
             continue;
         }
         for &i in slots.iter().filter(|&&i| i < heap.desc.count) {
+            // A previous demand may have found no free page. Keep just this
+            // slot eligible; a descriptor in scratch cannot satisfy its read.
+            if !host.has_read_slot(i) && host.recorded_placed(i).is_some() {
+                crate::shadow::forget_read(i);
+                continue;
+            }
             host.mirror(i, start + u64::from(i) * u64::from(step), true);
             host.stamp_read(i);
         }

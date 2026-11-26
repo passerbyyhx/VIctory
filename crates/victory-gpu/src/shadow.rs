@@ -814,38 +814,95 @@ pub(crate) fn view_writes(memory: bool) -> Option<u64> {
     bitmap(memory).map(|b| b.gpu)
 }
 
-/// Heap slots whose texture views shaders read: the marks seen so far (a
-/// slot's stays set in the bitmap until [`forget_read`]), and the slots to
-/// clear at the next [`take_reads`].
-static READS: Mutex<(Vec<u32>, Vec<u32>)> = Mutex::new((Vec::new(), Vec::new()));
+/// Slot marks seen at least once, slots to re-arm, and marks cleared before
+/// resource eviction could consume them via `reads_since`.
+#[derive(Default)]
+struct ReadMarks {
+    seen: Vec<u32>,
+    forgotten: Vec<u32>,
+    window: Vec<u32>,
+}
 
-/// After a submission: the heap slots its shaders first read texture views
-/// at (`victory_shader::emit`, "Read marks"), each once until
-/// [`forget_read`]. Clears the slots forgotten since first.
-pub(crate) fn take_reads() -> Vec<u32> {
+static READS: Mutex<ReadMarks> = Mutex::new(ReadMarks {
+    seen: Vec::new(),
+    forgotten: Vec::new(),
+    window: Vec::new(),
+});
+
+/// The slot marks of both bitmaps. The caller must hold READS, with the GPU
+/// idle, for the duration of these slices and use only one set at a time.
+unsafe fn read_maps() -> Vec<&'static mut [u32]> {
     let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
     let first = (victory_shader::emit::VIEW_READS / 32) as usize;
-    // Both bitmaps: shaders that use title memory mark their reads in theirs.
-    let mut maps: Vec<&mut [u32]> = [false, true]
-        .into_iter()
-        .filter_map(bitmap)
-        // SAFETY: the mapped bitmap's read marks; the GPU is done with them
-        // (one submission runs at a time).
+    [false, true].into_iter().filter_map(bitmap)
+        // SAFETY: disjoint mapped buffers with `words` slot-read words.
         .map(|b| unsafe { std::slice::from_raw_parts_mut((b.data as *mut u32).add(first), words) })
-        .collect();
-    if maps.is_empty() {
-        return Vec::new();
-    }
-    let mut reads = READS.lock().unwrap_or_else(|e| e.into_inner());
-    let (seen, forgotten) = &mut *reads;
-    seen.resize(words, 0);
-    for slot in forgotten.drain(..) {
-        let (w, bit) = ((slot / 32) as usize, 1u32 << (slot % 32));
-        if w < words {
-            maps.iter_mut().for_each(|bits| bits[w] &= !bit);
-            seen[w] &= !bit;
+        .collect()
+}
+
+impl ReadMarks {
+    fn clear_forgotten(&mut self, maps: &mut [&mut [u32]]) {
+        for slot in self.forgotten.drain(..) {
+            let (w, bit) = ((slot / 32) as usize, 1u32 << (slot % 32));
+            let mut read = false;
+            for map in &mut *maps {
+                if let Some(word) = map.get_mut(w) {
+                    read |= *word & bit != 0;
+                    *word &= !bit;
+                }
+            }
+            if read {
+                if self.window.len() <= w {
+                    self.window.resize(w + 1, 0);
+                }
+                self.window[w] |= bit;
+            }
+            if let Some(word) = self.seen.get_mut(w) {
+                *word &= !bit;
+            }
         }
     }
+
+    fn take_window(&mut self, maps: &mut [&mut [u32]]) -> Vec<u32> {
+        let mut slots = Vec::new();
+        for bits in maps.iter_mut().map(|map| &mut **map).chain(std::iter::once(self.window.as_mut_slice())) {
+            for (w, word) in bits.iter_mut().enumerate() {
+                let mut x = std::mem::take(word);
+                while x != 0 {
+                    slots.push(w as u32 * 32 + x.trailing_zeros());
+                    x &= x - 1;
+                }
+            }
+        }
+        self.window.clear();
+        slots.sort_unstable();
+        slots.dedup();
+        slots
+    }
+}
+
+/// Before executing a paged submission, re-arm slots left null since the
+/// previous one. Clearing them after the shader ran would erase its first read.
+pub(crate) fn begin_paged_reads() {
+    let mut reads = READS.lock().unwrap_or_else(|e| e.into_inner());
+    if !reads.forgotten.is_empty() {
+        // SAFETY: the preceding submission finished and the next has not begun.
+        let mut maps = unsafe { read_maps() };
+        reads.clear_forgotten(&mut maps);
+    }
+}
+
+/// After a submission: the heap slots its shaders first read texture views
+/// at, each once until forgotten. Discard marks invalidated by title writes
+/// since the submission began.
+pub(crate) fn take_reads() -> Vec<u32> {
+    let mut reads = READS.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: the GPU has finished; READS excludes other CPU accessors.
+    let mut maps = unsafe { read_maps() };
+    let Some(first) = maps.first() else { return Vec::new() };
+    reads.seen.resize(first.len(), 0);
+    reads.clear_forgotten(&mut maps);
+    let seen = &mut reads.seen;
     let mut new = Vec::new();
     for (w, s) in seen.iter_mut().enumerate() {
         let mut fresh = maps.iter().fold(0, |x, bits| x | bits[w]) & !*s;
@@ -864,29 +921,39 @@ pub(crate) fn take_reads() -> Vec<u32> {
 /// has seen every mark: its own record of slots seen keeps a slot read
 /// again from being reported as new.
 pub(crate) fn reads_since() -> Vec<u32> {
-    let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
-    let first = (victory_shader::emit::VIEW_READS / 32) as usize;
-    let mut slots = Vec::new();
-    for b in [false, true].into_iter().filter_map(bitmap) {
-        // SAFETY: the mapped bitmap's read marks; no submission runs.
-        let bits = unsafe { std::slice::from_raw_parts_mut((b.data as *mut u32).add(first), words) };
-        for (w, word) in bits.iter_mut().enumerate() {
-            let mut x = std::mem::take(word);
-            while x != 0 {
-                slots.push(w as u32 * 32 + x.trailing_zeros());
-                x &= x - 1;
-            }
-        }
+    let mut reads = READS.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: between submissions, with READS held throughout.
+    let mut maps = unsafe { read_maps() };
+    reads.take_window(&mut maps)
+}
+
+#[cfg(test)]
+#[test]
+fn rearming_shared_indices_preserves_the_eviction_window() {
+    let mut reads = ReadMarks { seen: vec![0; 2], ..Default::default() };
+    let (mut plain, mut memory) = ([0; 2], [0; 2]);
+    for _ in 0..2 {
+        plain[1] |= 0b011;
+        memory[1] |= 0b110;
+        reads.seen[1] |= 0b111;
+        reads.forgotten.extend(32..35);
+        reads.clear_forgotten(&mut [&mut plain, &mut memory]);
+        assert_eq!((plain[1], memory[1], reads.seen[1]), (0, 0, 0));
+        assert_eq!(reads.window, [0, 0b111]);
     }
-    slots.sort_unstable();
-    slots.dedup();
-    slots
+    memory[1] = 0b1010;
+    assert_eq!(reads.take_window(&mut [&mut plain, &mut memory]), [32, 33, 34, 35]);
+    assert!(reads.take_window(&mut [&mut plain, &mut memory]).is_empty());
 }
 
 /// Heap slot `slot` now holds a texture view left null: its next read is
 /// marked again.
 pub(crate) fn forget_read(slot: u32) {
-    READS.lock().unwrap_or_else(|e| e.into_inner()).1.push(slot);
+    forget_reads([slot]);
+}
+
+pub(crate) fn forget_reads(slots: impl IntoIterator<Item = u32>) {
+    READS.lock().unwrap_or_else(|e| e.into_inner()).forgotten.extend(slots);
 }
 
 /// Read marks of view heap pages: one per page of heap indices.

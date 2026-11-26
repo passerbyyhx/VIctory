@@ -232,6 +232,11 @@ impl Pages {
         self.stamp_page((index / PAGE) as usize);
     }
 
+    /// Whether the title slot has a physical page, without allocating or stamping it.
+    pub(super) fn contains(&self, index: u32) -> bool {
+        self.lock().host.get((index / PAGE) as usize).is_some_and(|&page| page != NULL_PAGE)
+    }
+
     /// The host slot of slot `index`, placing its page if it has none and
     /// `place` (a write); None where it has none (none left, or not to
     /// place). Its page is used now.

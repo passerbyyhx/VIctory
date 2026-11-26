@@ -942,7 +942,11 @@ impl HostHeap {
         }
         let host = host();
         for &(page, host_page) in &taken {
-            for index in page * PAGE..((page + 1) * PAGE).min(self.count) {
+            let slots = page * PAGE..((page + 1) * PAGE).min(self.count);
+            // A previously sampled slot must report its next demand even
+            // when its title record survives retirement unchanged.
+            crate::shadow::forget_reads(slots.clone().filter(|&i| made[i as usize] != 0));
+            for index in slots {
                 self.keep(index, None);
                 self.set_mark(index, None);
                 self.viewed.set(index, None, false);
@@ -1213,10 +1217,19 @@ impl HostHeap {
     /// The view of slot `index` if it is a placed texture's left without a
     /// host view (made when read).
     pub(crate) fn unmade_placed(&self, index: u32) -> Option<View> {
+        let view = self.recorded_placed(index)?;
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some_and(Option::is_some);
+        (!kept).then_some(view)
+    }
+
+    pub(crate) fn recorded_placed(&self, index: u32) -> Option<View> {
         let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
         let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten()?;
-        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some_and(Option::is_some);
-        (is_placed_texture(&view) && !kept).then_some(view)
+        is_placed_texture(&view).then_some(view)
+    }
+
+    pub(crate) fn has_read_slot(&self, index: u32) -> bool {
+        self.pages.as_ref().is_none_or(|p| p.contains(index))
     }
 
     /// A shader read slot `index` through the heap: the texture it views
