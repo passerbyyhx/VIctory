@@ -7,16 +7,39 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_TYPELESS;
 #[test]
 #[ignore = "run alone on a paged D3D12 device with normal page reclamation"]
 fn placed_and_committed_textures_after_page_restoration() {
-    check(false);
+    check(false, Probe::FirstRetry);
 }
 
 #[test]
 #[ignore = "run alone on a paged D3D12 device with normal page reclamation"]
 fn placed_texture_previously_sampled_with_no_free_page() {
-    check(true);
+    check(true, Probe::FirstRetry);
 }
 
-fn check(early: bool) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Probe {
+    FirstRetry,
+    Control,
+    Alias,
+    NewPixel,
+}
+
+#[test]
+#[ignore = "one process per arm and adapter; needs descriptor paging"]
+fn compare_placed_alias_and_new_pixel() {
+    let mode = std::env::var("VICTORY_TEST_PLACED_ARM").unwrap_or_else(|_| "control".into());
+    let probe = match mode.as_str() {
+        "control" => Probe::Control,
+        "alias" => Probe::Alias,
+        "new-pixel" => Probe::NewPixel,
+        _ => panic!("expected VICTORY_TEST_PLACED_ARM=control, alias or new-pixel"),
+    };
+    let early = std::env::var("VICTORY_TEST_PLACED_D0").as_deref() == Ok("1");
+    eprintln!("experiment arm={mode} D0={early}");
+    check(early, probe);
+}
+
+fn check(early: bool, probe: Probe) {
     let host = host().expect("D3D12 device");
     assert!(view_pages(), "requires descriptor paging");
     report_adapter(host);
@@ -44,6 +67,23 @@ fn check(early: bool) {
         })
         .collect();
     assert_eq!(pages.counts().0, 0);
+    // This filler page exists in every arm, is kept live while aging and is
+    // distinct from the page being reclaimed. No additional title page is taken.
+    let alias = fillers[0] + 1;
+    let alias_physical = physical(alias).unwrap();
+    assert_ne!(alias_physical / PAGE, original / PAGE);
+    let with_alias = probe == Probe::Alias;
+    let new_pixel = probe == Probe::NewPixel;
+    let records_before = pages.counts();
+    if with_alias {
+        source.write_placed_green(alias);
+        assert_eq!(source.placed_record(A), source.placed_record(alias));
+    }
+    assert_eq!(physical(alias), Some(alias_physical));
+    assert_eq!(pages.counts(), records_before);
+    eprintln!(
+        "full-pool before/after alias registration={records_before:?}, reference virtual={alias} physical={alias_physical}, reused physical={original}"
+    );
     source.write_yellow(B + 1);
     source.write_placed_green(B + 2);
     assert_eq!(physical(B), None);
@@ -51,8 +91,9 @@ fn check(early: bool) {
         source.write_placed_green(B);
     }
 
-    let outputs = [count + 7, count + 8];
-    let buffers = outputs.map(|i| {
+    let outputs = [count + 7, count + 8, count + 9];
+    let output_count = if with_alias { 3 } else { 2 };
+    let make_output = |&i: &u32| {
         let (buffer, mapped) = host.shared_buffer(16).unwrap();
         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
@@ -71,10 +112,19 @@ fn check(early: bool) {
                 .CreateUnorderedAccessView(&buffer, None, Some(&desc), heap.cpu(i))
         };
         (buffer, mapped)
-    });
+    };
+    let buffers: Vec<_> = outputs[..output_count].iter().map(make_output).collect();
     let shader = [A, B].map(|i| [translated_load(i), translated_load(i + 1)]);
+    let reference = with_alias.then(|| translated_load(alias));
+    let held = |slot: u32| {
+        let kept = heap.kept.lock().unwrap();
+        kept[slot as usize]
+            .as_ref()
+            .map(|(r, _)| windows::core::Interface::as_raw(r) as usize)
+    };
     let green = [0., 1., 0., 1.];
     let yellow = [1., 1., 0., 1.];
+    let blue = [0., 0., 1., 1.];
     let black = [0.; 4];
     let sample = |index: usize, n: usize| {
         let slot = [A, B][index];
@@ -86,26 +136,49 @@ fn check(early: bool) {
             )
         };
         let before = state();
+        let handles = || [slot, slot + 1, alias].map(held);
+        let ids_before = handles();
+        let uploads = crate::bindless::test_heap_uploads();
         let list = host.new_list().unwrap();
         list.defer_heap(&heap.viewed);
-        for (i, (_, mapped)) in buffers.iter().enumerate() {
+        let pipelines = shader[index].iter().chain(reference.iter());
+        for ((pipeline, (_, mapped)), output) in pipelines.zip(&buffers).zip(outputs) {
             // SAFETY: the preceding submission has finished.
             unsafe { mapped.cast::<[f32; 4]>().write([f32::NAN; 4]) };
-            record_read(&list, heap, &shader[index][i], outputs[i]);
+            record_read(&list, heap, pipeline, output);
         }
         list.close();
         host.execute(&[&list]);
         assert!(!heap.kept(slot + 2), "unread placed neighbor");
-        let colors = buffers.each_ref().map(|(_, p)| {
-            // SAFETY: the queue finished both dispatches.
-            unsafe { p.cast::<[f32; 4]>().read() }
-        });
+        let colors: Vec<_> = buffers
+            .iter()
+            .map(|(_, p)| {
+                // SAFETY: the queue finished all dispatches.
+                unsafe { p.cast::<[f32; 4]>().read() }
+            })
+            .collect();
+        assert_eq!(physical(alias), Some(alias_physical));
+        let ids_after = handles();
+        let uploads_after = crate::bindless::test_heap_uploads();
         eprintln!(
-            "virtual {slot}/{} D{n}: {before:?} -> {:?}; placed/committed={colors:?}",
+            "D{n} target/committed/alias kept COM={ids_before:x?} -> {ids_after:x?}, heap uploads={uploads:?} -> {uploads_after:?}"
+        );
+        eprintln!(
+            "virtual {slot}/{} D{n}: {before:?} -> {:?}; target/committed/(alias)={colors:?}",
             slot + 1,
             state()
         );
-        colors
+        if with_alias && ids_before[2].is_some() {
+            assert_eq!(ids_after[2], ids_before[2], "persistent alias COM");
+            if let Some(target) = ids_after[0] {
+                assert_eq!(Some(target), ids_after[2], "matching live D3D12 resource");
+            }
+            assert_eq!(colors[2], green, "resident alias");
+        }
+        if !with_alias {
+            assert_eq!(ids_after[2], None);
+        }
+        [colors[0], colors[1]]
     };
     // Initialize the resident placed SRV through ordinary translated reads.
     for n in 1..=3 {
@@ -129,6 +202,19 @@ fn check(early: bool) {
             }
             host.execute(&[&empty]);
         }
+        assert_eq!(physical(to), None);
+        if pass == 1 && new_pixel {
+            let record = source.placed_record(A);
+            assert_eq!(record, source.placed_record(B));
+            source.change_placed_green_to_blue();
+            assert_eq!(source.placed_record(A), record);
+            assert_eq!(source.placed_record(B), record);
+            eprintln!(
+                "CPU title texel green -> blue after last B, A unmapped, pool={:?}, uploads={:?}",
+                pages.counts(),
+                crate::bindless::test_heap_uploads()
+            );
+        }
         source.write_green(pressure + pass as u32);
         if pass == 0 && !early {
             source.write_placed_green(B);
@@ -145,8 +231,16 @@ fn check(early: bool) {
             assert_eq!((physical(from), physical(to)), (None, Some(original)));
             trace.push(rgba[0]);
         }
-        assert_eq!(trace[3], green, "placed D4");
+        assert_eq!(
+            trace[3],
+            if new_pixel && pass == 1 { blue } else { green },
+            "placed D4"
+        );
         transfers.push(trace);
+    }
+    if probe != Probe::FirstRetry {
+        eprintln!("transfer traces A->B then B->A={transfers:?}");
+        return;
     }
     for sequence in transfers {
         assert_eq!(sequence, [black, green, green, green], "placed first retry");

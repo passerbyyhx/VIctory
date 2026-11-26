@@ -20,6 +20,7 @@ pub(super) struct RegisteredTextures {
     heap: TitleObject,
     red: TitleObject,
     blue: TitleObject,
+    placed_address: std::sync::OnceLock<usize>,
 }
 
 impl RegisteredTextures {
@@ -107,7 +108,12 @@ impl RegisteredTextures {
         let blue = texture([0.0, 0.0, 1.0, 1.0]);
         list.close();
         host.execute(&[&list]);
-        Self { heap, red, blue }
+        Self {
+            heap,
+            red,
+            blue,
+            placed_address: Default::default(),
+        }
     }
 
     pub(super) fn host_heap(&self) -> &HostHeap {
@@ -135,9 +141,9 @@ impl RegisteredTextures {
     }
 
     pub(super) fn write_placed_green(&self, index: u32) {
-        // The placed-resource cache retains its title address for the process lifetime.
-        static ADDRESS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        let address = *ADDRESS.get_or_init(|| {
+        // The cache retains its address for the process lifetime. Keep the
+        // address per fixture so a changed texel cannot leak into another test.
+        let address = *self.placed_address.get_or_init(|| {
             let p = crate::watch::tests::pool(1);
             // SAFETY: a 64x64 linear RGBA8 image fits in this 64 KiB allocation.
             unsafe { (p as *mut [u8; 4]).write([0, 255, 0, 255]) };
@@ -152,6 +158,25 @@ impl RegisteredTextures {
         let handle = descriptor::heap(self.heap.0).start + u64::from(index) * u64::from(step);
         descriptor::create_placed_srv(null(), &words, &desc, handle);
         assert!(matches!(descriptor::view(handle), Some(descriptor::View::Placed(false, ..))));
+    }
+
+    pub(super) fn placed_record(&self, index: u32) -> ([u32; 14], [u32; 16]) {
+        let step = descriptor::increment(VIEWS_KIND).unwrap();
+        let handle = descriptor::heap(self.heap.0).start + u64::from(index) * u64::from(step);
+        let Some(descriptor::View::Placed(false, words, desc)) = descriptor::view(handle) else {
+            panic!("registered slot {index} has no placed SRV");
+        };
+        (words, desc)
+    }
+
+    pub(super) fn change_placed_green_to_blue(&self) {
+        let pixel = *self.placed_address.get().unwrap() as *mut [u8; 4];
+        // SAFETY: this fixture owns the write-watched allocation. The caller
+        // waited for the last read and has exclusive access to this texel.
+        unsafe {
+            assert_eq!(pixel.read(), [0, 255, 0, 255]);
+            pixel.write([0, 0, 255, 255]);
+        }
     }
 
     pub(super) fn write_yellow(&self, index: u32) {

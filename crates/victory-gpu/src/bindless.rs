@@ -333,6 +333,19 @@ static HEAP_DRAWS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 #[cfg(feature = "diagnostics")]
 static UPLOADED: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+pub(crate) fn test_heap_uploads() -> Option<u64> {
+    // Observe the submission prelude without resolving a resource or making a copy.
+    #[cfg(feature = "diagnostics")]
+    {
+        Some(UPLOADED.load(Relaxed))
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    {
+        None
+    }
+}
+
 /// A draw or dispatch runs a shader that indexes the heap (and writes
 /// through it).
 pub(crate) fn note_draw(writes: bool) {
