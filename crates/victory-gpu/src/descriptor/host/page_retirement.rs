@@ -3,6 +3,7 @@
 //! registered title heap and runs the production policy at its normal limits.
 
 mod colors;
+mod placed_retry;
 mod reclaim;
 mod registered_textures;
 mod translated_reads;

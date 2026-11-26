@@ -134,6 +134,32 @@ impl RegisteredTextures {
         self.write(slot, self.blue.0, mapping);
     }
 
+    pub(super) fn write_placed_green(&self, index: u32) {
+        // The placed-resource cache retains its title address for the process lifetime.
+        static ADDRESS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let address = *ADDRESS.get_or_init(|| {
+            let p = crate::watch::tests::pool(1);
+            // SAFETY: a 64x64 linear RGBA8 image fits in this 64 KiB allocation.
+            unsafe { (p as *mut [u8; 4]).write([0, 255, 0, 255]) };
+            p
+        }) as u64;
+        let words = [3, 0, 0, 0, 64, 0, 64, 1 | (1 << 16), 28, 1, 0, 0x100, 0, 0];
+        let mut desc = [0; 16];
+        desc[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        desc[10] = address as u32;
+        desc[11] = (address >> 32) as u32;
+        let step = descriptor::increment(VIEWS_KIND).unwrap();
+        let handle = descriptor::heap(self.heap.0).start + u64::from(index) * u64::from(step);
+        descriptor::create_placed_srv(null(), &words, &desc, handle);
+        assert!(matches!(descriptor::view(handle), Some(descriptor::View::Placed(false, ..))));
+    }
+
+    pub(super) fn write_yellow(&self, index: u32) {
+        let mapping = D3D12_SHADER_COMPONENT_MAPPING_ALWAYS_SET_BIT_AVOIDING_ZEROMEM_MISTAKES
+            | 2 | (2 << 3) | (3 << 9);
+        self.write(index, self.blue.0, mapping);
+    }
+
     fn write(&self, index: u32, resource: This, mapping: u32) {
         let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R8G8B8A8_UNORM,
