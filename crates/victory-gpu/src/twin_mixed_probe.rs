@@ -7,6 +7,10 @@ use windows::Win32::Graphics::Dxgi::{
 use windows::core::Interface;
 
 fn adapter(host: &Host) {
+    assert!(
+        host.device.cast::<ID3D12InfoQueue>().is_ok(),
+        "D3D12 debug queue required for barrier checks"
+    );
     // SAFETY: the adapter is resolved from the actual device LUID.
     let d = unsafe {
         let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
@@ -32,6 +36,33 @@ fn adapter(host: &Host) {
             "{name} does not contain {required}"
         );
     }
+}
+
+fn check_diagnostics(host: &Host, phase: &str) {
+    let queue = host.device.cast::<ID3D12InfoQueue>().unwrap();
+    let mut findings = Vec::new();
+    // SAFETY: each message buffer is aligned and sized by the same queue.
+    unsafe {
+        for i in 0..queue.GetNumStoredMessages() {
+            let mut bytes = 0;
+            queue.GetMessage(i, None, &mut bytes).unwrap();
+            let mut storage = vec![0u64; bytes.div_ceil(8)];
+            let ptr = storage.as_mut_ptr().cast::<D3D12_MESSAGE>();
+            queue.GetMessage(i, Some(ptr), &mut bytes).unwrap();
+            let message = &*ptr;
+            if message.Severity.0 <= D3D12_MESSAGE_SEVERITY_WARNING.0 {
+                let description =
+                    std::slice::from_raw_parts(message.pDescription, message.DescriptionByteLength);
+                findings.push(format!(
+                    "id={} {}",
+                    message.ID.0,
+                    String::from_utf8_lossy(description).trim_end_matches('\0')
+                ));
+            }
+        }
+    }
+    eprintln!("phase={phase} warnings_or_errors={}", findings.len());
+    assert!(findings.is_empty(), "{phase}: {findings:?}");
 }
 
 fn depth_texture(
@@ -168,6 +199,8 @@ fn read_planes(
         .map(|(texture, index)| {
             let (f, row_bytes, total) = footprint(host, texture, *index);
             let (back, ptr) = list.readback(host, total).unwrap();
+            // SAFETY: this mapped readback allocation covers total bytes.
+            unsafe { ptr.write_bytes(0x5a, total as usize) };
             record_copy(&list.list, placed(&back, f), sub(texture, *index));
             (ptr, f.Footprint.RowPitch as usize, row_bytes)
         })
@@ -276,7 +309,17 @@ fn both_planes(console: u32, to_depth: bool, deny: bool) {
         };
     }
     let before = read_planes(host, &list, &resources);
-    let mut states = [COPY_SOURCE; 3];
+    let mut states = [DEPTH_WRITE, UNORDERED_ACCESS, UNORDERED_ACCESS];
+    for (texture, state) in textures.into_iter().zip(states) {
+        unsafe {
+            list.list.ResourceBarrier(&[transition(
+                &texture.texture,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATES(state as i32),
+            )]);
+        }
+    }
+    let copies_before = COPIES.load(Relaxed);
     let mut moved = Vec::new();
     let mut calls = 0;
     let converted = twin.copy_with(
@@ -285,8 +328,8 @@ fn both_planes(console: u32, to_depth: bool, deny: bool) {
         to_depth,
         &mut |t, state| {
             let i = textures.iter().position(|p| Arc::ptr_eq(t, p)).unwrap();
-            moved.push((i, state));
             let old = std::mem::replace(&mut states[i], state);
+            moved.push((i, old, state));
             (old != state).then(|| {
                 transition(
                     &t.texture,
@@ -312,8 +355,9 @@ fn both_planes(console: u32, to_depth: bool, deny: bool) {
         }
     }
     let after = read_planes(host, &list, &resources);
-    assert_eq!(host.log_messages(), None, "debug layer while recording");
     list.close();
+    check_diagnostics(host, "closed");
+    list.defer_after(move || check_diagnostics(host, "after GPU completion"));
     host.execute(&[&list]);
     unsafe { host.device.GetDeviceRemovedReason() }.unwrap();
     let (before, after) = (rows(&before), rows(&after));
@@ -342,11 +386,21 @@ fn both_planes(console: u32, to_depth: bool, deny: bool) {
     assert_eq!(after, expected, "both depth payloads and stencil source");
     assert_eq!(calls, 1);
     assert!(!converted);
+    let (stencil_state, host_state) = if to_depth {
+        (COPY_SOURCE, COPY_DEST)
+    } else {
+        (COPY_DEST, COPY_SOURCE)
+    };
     assert_eq!(
-        moved.iter().map(|m| m.0).collect::<Vec<_>>(),
-        [2, 0],
-        "only the stencil twin and host resource transition"
+        moved,
+        [
+            (2, UNORDERED_ACCESS, stencil_state),
+            (0, DEPTH_WRITE, host_state)
+        ]
     );
+    let copies_after = COPIES.load(Relaxed);
+    assert_eq!(copies_after, copies_before + 1);
+    eprintln!("copies {copies_before} -> {copies_after}");
 }
 
 #[test]
