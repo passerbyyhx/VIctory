@@ -462,6 +462,11 @@ impl Pages {
     }
 
     #[cfg(test)]
+    pub(super) fn submission_age(&self, slot: u32) -> u32 {
+        self.now.load(Ordering::Relaxed) - self.used[(slot / PAGE) as usize].load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
     pub(super) fn counts(&self) -> (u32, u32, u64, u64, u64) {
         let p = self.lock();
         (

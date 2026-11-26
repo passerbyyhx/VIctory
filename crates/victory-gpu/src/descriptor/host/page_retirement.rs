@@ -177,19 +177,31 @@ fn two_colors_across_a_submission_fence() {
 #[test]
 #[ignore = "requires a paged D3D12 device and a runtime that recycles descriptor pages"]
 fn expect_reuse_after_submission_fence() {
-    expect_reuse(1 << 20);
+    expect_reuse(1 << 20, reclaim::Age::Strict);
 }
 
 #[test]
 #[ignore = "requires a paged D3D12 device and a runtime that recycles descriptor pages"]
 fn expect_reuse_at_paged_title_limit() {
-    expect_reuse(super::PAGED_TITLE_VIEWS);
+    expect_reuse(super::PAGED_TITLE_VIEWS, reclaim::Age::Strict);
 }
 
-fn expect_reuse(title_slots: u32) {
+#[test]
+#[ignore = "requires a paged D3D12 device and pressure-triggered page reclamation"]
+fn expect_reuse_under_short_pressure() {
+    expect_reuse(1 << 20, reclaim::Age::Pressured);
+}
+
+#[test]
+#[ignore = "requires a paged D3D12 device and pressure-triggered page reclamation"]
+fn expect_reuse_under_short_pressure_at_paged_title_limit() {
+    expect_reuse(super::PAGED_TITLE_VIEWS, reclaim::Age::Pressured);
+}
+
+fn expect_reuse(title_slots: u32, age: reclaim::Age) {
     victory_core::logging::init("victory_gpu::descriptor::pages=info");
     let host = host().expect("D3D12 device required to verify page reuse");
     assert!(view_pages(), "set VICTORY_VIEW_PAGES=1 to exercise paging");
     report_adapter(host);
-    reclaim::check(host, title_slots);
+    reclaim::check(host, title_slots, age);
 }

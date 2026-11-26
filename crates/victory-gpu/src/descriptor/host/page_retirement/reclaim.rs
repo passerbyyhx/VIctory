@@ -41,7 +41,32 @@ fn age(host: &Host, heap: &HostHeap, fillers: &[u32], resident: u32, original: u
     );
 }
 
-pub(super) fn check(host: &Host, title_slots: u32) {
+#[derive(Clone, Copy)]
+pub(super) enum Age {
+    Strict,
+    Pressured,
+}
+
+/// Leave every filler hot. Inspect the resident's real submission stamp without
+/// acquiring a descriptor handle, which would make that page hot too.
+fn idle_until_age(host: &Host, heap: &HostHeap, fillers: &[u32], resident: u32, target_age: u32) {
+    let pages = heap.pages.as_ref().unwrap();
+    let empty = host.new_list().unwrap();
+    empty.close();
+    let initial_age = pages.submission_age(resident);
+    assert!(initial_age <= target_age);
+    for age in initial_age..target_age {
+        if (age - initial_age).is_multiple_of(16) {
+            for &slot in fillers {
+                heap.gpu(slot);
+            }
+        }
+        host.execute(&[&empty]);
+    }
+    assert_eq!(pages.submission_age(resident), target_age);
+}
+
+pub(super) fn check(host: &Host, title_slots: u32, policy: Age) {
     let control_slot = title_slots + 7;
     let output_slot = control_slot + 1;
     let slots = [A, B, control_slot];
@@ -49,6 +74,8 @@ pub(super) fn check(host: &Host, title_slots: u32) {
     let unread = (title_slots / PAGE - 1) * PAGE + 7;
     let source = RegisteredTextures::new(host, title_slots);
     let heap = source.host_heap();
+    assert_eq!(heap.count(), title_slots);
+    assert_eq!(heap.dynamic_end() - heap.count(), 65_536);
     let placements = || slots.map(|slot| placement(heap, slot));
     let pages = heap.pages.as_ref().expect("paged title heap");
     let colors = source.colors();
@@ -100,6 +127,10 @@ pub(super) fn check(host: &Host, title_slots: u32) {
     }
     let full = pages.counts();
     assert_eq!(full.0, 0, "full physical heap");
+    // Of the 3,906 physical pages, two are reserved and 256 cover dynamic
+    // slots. A partial last title page shares one more with the dynamic range.
+    let title_pages = if title_slots.is_multiple_of(PAGE) { 3_648 } else { 3_647 };
+    assert_eq!(full.1, title_pages, "allocatable title pages");
     assert_eq!((full.2, full.3, full.4), (0, 0, 0));
     source.write_green(B);
     // A second distinct refused page triggers the allocator's incremental
@@ -125,7 +156,10 @@ pub(super) fn check(host: &Host, title_slots: u32) {
         "A={A} physical={original}; B={B} unmapped; control={control}; (free, in use, taken back, restored after take-back, restored after refusal)={full:?}"
     );
 
-    age(host, heap, &fillers, A, original);
+    match policy {
+        Age::Strict => age(host, heap, &fillers, A, original),
+        Age::Pressured => idle_until_age(host, heap, &fillers, A, 31),
+    }
     clear_output();
     let (old, old_pixels) = colors.record_with(host, heap, slots, |list| {
         record_read(list, heap, &red, output_slot)
@@ -177,20 +211,69 @@ pub(super) fn check(host: &Host, title_slots: u32) {
         (translated, sampled)
     };
 
-    age(host, heap, &fillers, A, original);
+    let prepare_transfer = |resident, check_one_shot: bool| {
+        if matches!(policy, Age::Strict) {
+            age(host, heap, &fillers, resident, original);
+            return None;
+        }
+        let start = Instant::now();
+        assert_eq!(
+            pages.submission_age(resident),
+            1,
+            "previous translated read"
+        );
+        let probing_slot = if check_one_shot {
+            unread + 1
+        } else {
+            unread + 3
+        };
+        if check_one_shot {
+            idle_until_age(host, heap, &fillers, resident, 31);
+            // A separate, previously unwritten slot on the unsampled overflow page.
+            source.write_green(probing_slot);
+            idle_until_age(host, heap, &fillers, resident, 32);
+            assert_eq!(placement(heap, resident), Some(original), "pressured at 32");
+            idle_until_age(host, heap, &fillers, resident, 33);
+            assert_eq!(
+                placement(heap, resident),
+                Some(original),
+                "no fresh refusal at 33"
+            );
+            eprintln!(
+                "slot {resident}: retained after refusal at age 32 and without fresh pressure at age 33"
+            );
+        } else {
+            idle_until_age(host, heap, &fillers, resident, 32);
+        }
+        source.write_green(probing_slot + 1);
+        assert_eq!(placement(heap, probing_slot + 1), None);
+        let eligible_age = pages.submission_age(resident) + 1;
+        eprintln!("slot {resident}: renewed refused write, next pass at age {eligible_age}");
+        Some(start)
+    };
+    let under_pressure = prepare_transfer(A, true);
     demand_missing(B, &green);
-    assert_eq!(placements(), [None, Some(original), Some(control)]);
-    assert_eq!(heap.page_table_entry(unread / PAGE), 0);
     let after_b = pages.counts();
+    let b_mapping = placements();
+    let b_readback = sample_restored(&green);
+    if let Some(start) = under_pressure {
+        eprintln!(
+            "short A->B: {b_mapping:?}, A/B/control={:?}, counts={after_b:?}, elapsed={:?}",
+            b_readback.1,
+            start.elapsed()
+        );
+        assert!(start.elapsed() < Duration::from_secs(10));
+    }
+    assert_eq!(b_mapping, [None, Some(original), Some(control)]);
+    assert_eq!(heap.page_table_entry(unread / PAGE), 0);
     assert_eq!(
         after_b,
         (0, full.1, 1, 0, 1),
         "B was refused on its first write"
     );
-    let b_readback = sample_restored(&green);
     eprintln!("B={B} reused physical {original}; counts={after_b:?}");
 
-    age(host, heap, &fillers, B, original);
+    let under_pressure = prepare_transfer(B, false);
     demand_missing(A, &red);
     assert_eq!(placements(), [Some(original), None, Some(control)]);
     let after_a = pages.counts();
@@ -200,6 +283,14 @@ pub(super) fn check(host: &Host, title_slots: u32) {
         "A was resident before the allocator took it back"
     );
     let a_readback = sample_restored(&red);
+    if let Some(start) = under_pressure {
+        eprintln!(
+            "short B->A: A/B/control={:?}, counts={after_a:?}, elapsed={:?}",
+            a_readback.1,
+            start.elapsed()
+        );
+        assert!(start.elapsed() < Duration::from_secs(10));
+    }
     assert_eq!(heap.page_table_entry(unread / PAGE), 0);
     eprintln!(
         "A={A} regained physical {original}; unused slot {unread} still unmapped; counts={after_a:?}"
