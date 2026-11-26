@@ -436,6 +436,25 @@ impl Pages {
         self.lock().host[page as usize]
     }
 
+    #[cfg(test)]
+    pub(super) fn limit_unused_pages(&mut self, n: u32) {
+        let next = self.lock().next;
+        assert!(n <= self.end - next);
+        self.end = next + n;
+    }
+
+    #[cfg(test)]
+    pub(super) fn counts(&self) -> (u32, u32, u64, u64, u64) {
+        let p = self.lock();
+        (
+            self.end - p.next + p.free.len() as u32,
+            p.in_use(),
+            p.taken_back,
+            p.placed_again,
+            p.placed_late,
+        )
+    }
+
     /// Takes pages back below `low` free host pages, up to `high` (tests).
     #[cfg(test)]
     pub(super) fn set_water(&self, low: u32, high: u32) {

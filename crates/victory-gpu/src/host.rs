@@ -21,6 +21,9 @@ use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObj
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCSTR, PCWSTR, s, w};
 
+#[cfg(test)]
+pub(crate) mod test_submission;
+
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
 pub(crate) fn pc_state(state: u32) -> u32 {
@@ -1222,6 +1225,18 @@ impl Host {
 
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        self.execute_lists(
+            runs,
+            #[cfg(test)]
+            None,
+        );
+    }
+
+    fn execute_lists(
+        &self,
+        runs: &[&HostList],
+        #[cfg(test)] mut probe: Option<&mut test_submission::Probe<'_>>,
+    ) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -1341,12 +1356,20 @@ impl Host {
             crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
+                #[cfg(test)]
+                if let Some(probe) = probe.as_ref() {
+                    probe.hold_queue(self);
+                }
                 self.queue.ExecuteCommandLists(group);
                 let waited = self
                     .queue
                     .Signal(&self.fence, *submitted)
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
+                    #[cfg(test)]
+                    result if probe.is_some() => {
+                        probe.take().unwrap().observe_and_wait(self, *submitted, result);
+                    }
                     Ok(()) => {
                         WaitForSingleObject(self.event, INFINITE);
                     }
