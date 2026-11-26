@@ -176,9 +176,19 @@ fn two_colors_across_a_submission_fence() {
 #[test]
 #[ignore = "requires a paged D3D12 device and a runtime that recycles descriptor pages"]
 fn expect_reuse_after_submission_fence() {
+    expect_reuse(1 << 20);
+}
+
+#[test]
+#[ignore = "requires a paged D3D12 device and a runtime that recycles descriptor pages"]
+fn expect_reuse_at_paged_title_limit() {
+    expect_reuse(super::PAGED_TITLE_VIEWS);
+}
+
+fn expect_reuse(title_slots: u32) {
     victory_core::logging::init("victory_gpu::descriptor::pages=info");
     let host = host().expect("D3D12 device required to verify page reuse");
     assert!(view_pages(), "set VICTORY_VIEW_PAGES=1 to exercise paging");
     report_adapter(host);
-    reclaim::check(host);
+    reclaim::check(host, title_slots);
 }
