@@ -561,7 +561,7 @@ pub(crate) mod tests {
     }
 
     /// A 64 KiB buffer at title memory of its own: the memory, the buffer.
-    fn title_buffer() -> (usize, crate::object::This) {
+    pub(crate) fn title_buffer() -> (usize, crate::object::This) {
         let memory = crate::watch::tests::pool(1);
         let bytes = crate::watch::PAGE as u64;
         let desc: [u32; 14] = [1, 0, 0, 0, bytes as u32, (bytes >> 32) as u32, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
@@ -573,11 +573,11 @@ pub(crate) mod tests {
         (memory, buffer)
     }
 
-    /// Paged view heaps, in `Host::execute`'s order after a submission
-    /// (views read made, then pages turned): a placed texture's slot in a
-    /// page taken back that a shader read again is made by `make_read`,
-    /// which places the page, and stays made when `turn_pages` makes the
-    /// page's other slots from the title's records.
+    /// Paged view heaps: a placed texture's slot in a page taken back that
+    /// a shader read again is made by `make_read`, which places the page,
+    /// and stays made when `turn_pages` makes the page's other slots from
+    /// the title's records after it (as a slot made for a draw does at the
+    /// heap sync).
     #[test]
     fn view_heap_pages_placed_by_a_read_keep_the_texture_made_for_it() {
         let Some(host) = host() else { return };
@@ -1666,14 +1666,16 @@ impl Host {
             .map(|(s, a, n, _)| (s.clone(), *a, *n))
             .collect();
         crate::shadow::copy_back_marks(&withheld, withholding);
-        // Texture views left null that shaders read: made for what follows.
+        // Texture views left null that shaders read, taken before pages turn
+        // (a page placed again forgets its slots' marks).
         let read = crate::shadow::take_reads();
-        if !read.is_empty() {
-            crate::descriptor::make_read(&read);
-        }
         // Paged view heaps: pages read are kept (placed again if taken back),
         // pages unused lately taken back where room runs low.
         crate::descriptor::turn_pages(&crate::shadow::take_page_reads(), std::time::Instant::now());
+        // The views read made for what follows, in the pages placed above.
+        if !read.is_empty() {
+            crate::descriptor::make_read(&read);
+        }
         for (shadow, address, len, goes_back) in &back {
             let (address, len) = (*address, *len);
             if *goes_back {

@@ -2102,6 +2102,43 @@ void main() {
 }
 "#;
 
+    /// A view of a 4x1 RGBA8 texture the title placed, linear, in memory of
+    /// its own (returned), written to slot `slot` of `title_heap`.
+    fn placed_texture_view(title_heap: &crate::descriptor::Heap, slot: u32) -> Vec<u8> {
+        let memory = vec![0u8; 1 << 16];
+        let address = memory.as_ptr() as u64;
+        let words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+        let mut view = [0u32; 16];
+        view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+        let at = title_heap.start + u64::from(slot) * 32;
+        crate::descriptor::create_placed_srv(std::ptr::null(), &words, &view, at);
+        memory
+    }
+
+    /// A submission through `Host::execute` whose shader (`READ_MARK_SOURCE`)
+    /// reads heap slot `slot`: its read mark and its page's are set.
+    fn submit_read(shader: &(ID3D12RootSignature, ID3D12PipelineState), slot: u32) {
+        let host = crate::host::host().unwrap();
+        let writes = crate::shadow::view_writes(false).expect("the read marks' bitmap");
+        let constants = [
+            victory_shader::emit::VIEW_READS + slot,
+            victory_shader::emit::VIEW_PAGE_READS + slot / victory_shader::emit::VIEW_PAGE_SLOTS,
+        ];
+        let list = host.new_list().unwrap();
+        // SAFETY: an open list and live objects.
+        unsafe {
+            list.list.SetComputeRootSignature(&shader.0);
+            list.list.SetComputeRootUnorderedAccessView(0, writes);
+            list.list
+                .SetComputeRoot32BitConstants(1, 2, constants.as_ptr().cast(), 0);
+            list.list.SetPipelineState(&shader.1);
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&list]);
+    }
+
     /// Paged view heaps, through `Host::execute`: a placed texture's slot
     /// that a shader reads in every submission, in a page taken back, reads
     /// null in the first submission after (its page has no place) and is
@@ -2110,45 +2147,19 @@ void main() {
     /// is placed again leave it made.
     #[test]
     fn a_placed_texture_in_a_page_taken_back_is_made_after_one_submission_reads_it() {
-        let Some(host) = crate::host::host() else {
+        if crate::host::host().is_none() {
             return;
-        };
+        }
         let Some((title_heap, heap_host)) = crate::host::tests::paged_view_heap(3) else {
             return;
         };
-        let null = std::ptr::null();
         let page = victory_shader::emit::VIEW_PAGE_SLOTS;
-        // A 4x1 RGBA8 texture, linear, in memory of its own, viewed in page 1.
-        let memory = vec![0u8; 1 << 16];
-        let address = memory.as_ptr() as u64;
-        let words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
-        let mut view = [0u32; 16];
-        view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
-        (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+        // Viewed in page 1.
         let slot = page + 99;
-        let at = title_heap.start + u64::from(slot) * 32;
-        crate::descriptor::create_placed_srv(null, &words, &view, at);
+        let _memory = placed_texture_view(title_heap, slot);
         let shader = compile_cs(READ_MARK_SOURCE);
-        let writes = crate::shadow::view_writes(false).expect("the read marks' bitmap");
-        let constants = [
-            victory_shader::emit::VIEW_READS + slot,
-            victory_shader::emit::VIEW_PAGE_READS + 1,
-        ];
         // A submission whose shader reads the slot.
-        let read = || {
-            let list = host.new_list().unwrap();
-            // SAFETY: an open list and live objects.
-            unsafe {
-                list.list.SetComputeRootSignature(&shader.0);
-                list.list.SetComputeRootUnorderedAccessView(0, writes);
-                list.list
-                    .SetComputeRoot32BitConstants(1, 2, constants.as_ptr().cast(), 0);
-                list.list.SetPipelineState(&shader.1);
-                list.list.Dispatch(1, 1, 1);
-            }
-            list.close();
-            host.execute(&[&list]);
-        };
+        let read = || submit_read(&shader, slot);
         // Read twice: the slot's read is taken and its texture made.
         crate::shadow::forget_read(slot);
         read();
@@ -2169,6 +2180,170 @@ void main() {
             made, [true; 4],
             "made after the first submission that read it"
         );
+    }
+
+    /// Two paged view heaps with a placed texture's view at the same slot,
+    /// read by a shader through the second: the first taking back the
+    /// page holding its own record there (which forgets the slot's read
+    /// mark) leaves the read in the eviction window (`reads_since`), with
+    /// another slot's, and the second heap's texture named.
+    #[test]
+    fn a_page_taken_back_keeps_another_heaps_read_of_its_slot_for_eviction() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        let Some((first_heap, first_host)) = crate::host::tests::paged_view_heap(2) else {
+            return;
+        };
+        let (second_heap, second_host) = crate::host::tests::paged_view_heap(2).unwrap();
+        let slot = victory_shader::emit::VIEW_PAGE_SLOTS + 61;
+        let _first = placed_texture_view(first_heap, slot);
+        let _second = placed_texture_view(second_heap, slot);
+        let at = |heap: &crate::descriptor::Heap| heap.start + u64::from(slot) * 32;
+        assert!(first_host.mirror(slot, at(first_heap), true).is_some());
+        assert!(second_host.mirror(slot, at(second_heap), true).is_some());
+        let texture = second_host.textures_at(&[slot]);
+        assert_eq!(texture.len(), 1, "the second heap's texture made");
+        let slots = crate::host::tests::without_submissions(|| {
+            crate::shadow::reads_since();
+            // The second heap's slot read, and slot 7.
+            crate::shadow::tests::mark_read(false, 7);
+            crate::shadow::tests::mark_read(false, slot);
+            crate::host::tests::take_back_all(first_host, &mut std::time::Instant::now());
+            assert_eq!(first_host.host_page_of(slot), Some(0), "taken back");
+            // As before the next submission.
+            crate::shadow::forget_reads_now();
+            crate::shadow::reads_since()
+        });
+        assert!(slots.contains(&7) && slots.contains(&slot), "both reads kept: {slots:?}");
+        let read = crate::descriptor::read_textures(&slots);
+        assert!(read.contains(&texture[0]), "the second heap's texture named");
+        assert!(second_host.kept(slot), "the second heap's slot holds its view");
+    }
+
+    /// Leaves `heap_host` no host page free, taking none back.
+    fn fill_view_heap(heap_host: &crate::descriptor::host::HostHeap) {
+        crate::host::tests::without_submissions(|| {
+            heap_host.hold_page_room(true);
+            heap_host.set_page_water(0, 0);
+        });
+    }
+
+    /// Leaves `heap_host`'s pages unused for 40 submissions (none taken back
+    /// meanwhile); pages are then taken back below one free host page, up to
+    /// one, where a write or a read finds no room (none is old enough
+    /// otherwise).
+    fn age_view_heap_pages(heap_host: &crate::descriptor::host::HostHeap) {
+        crate::host::tests::without_submissions(|| {
+            heap_host.set_page_water(0, 0);
+            for _ in 0..40 {
+                heap_host.take_back_pages(std::time::Instant::now());
+            }
+            heap_host.set_page_water(1, 1);
+        });
+    }
+
+    /// Gives `heap_host` the room [`fill_view_heap`] held back, and takes
+    /// no page back.
+    fn unfill_view_heap(heap_host: &crate::descriptor::host::HostHeap) {
+        crate::host::tests::without_submissions(|| {
+            heap_host.hold_page_room(false);
+            heap_host.set_page_water(0, 0);
+        });
+    }
+
+    /// Paged view heaps with no host page free, through `Host::execute`: a
+    /// placed texture's page taken back, whose host page another page took
+    /// since, is placed again when a shader reads the texture (the other
+    /// page, unused lately, is taken back for it), and the texture is made
+    /// for the next submission, as the page's buffer view is; a placed
+    /// texture there that no shader reads stays unmade.
+    #[test]
+    fn a_placed_texture_read_with_no_page_free_is_made_after_one_submission() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        let Some((title_heap, heap_host)) = crate::host::tests::paged_view_heap(4) else {
+            return;
+        };
+        let page = victory_shader::emit::VIEW_PAGE_SLOTS;
+        let at = |s: u32| title_heap.start + u64::from(s) * 32;
+        // Page 3: a placed texture read, one not read, a buffer's raw view.
+        let (read, unread, buffer_view) = (3 * page + 99, 3 * page + 50, 3 * page + 1);
+        let _read = placed_texture_view(title_heap, read);
+        let _unread = placed_texture_view(title_heap, unread);
+        let (_, buffer) = crate::host::tests::title_buffer();
+        let desc: [u32; 10] = [39, 1, 0x1688, 0, 0, 0, 64, 0, 1, 0];
+        crate::descriptor::create_srv(std::ptr::null(), buffer, &desc, at(buffer_view));
+        assert!(heap_host.mirror(read, at(read), true).is_some());
+        assert!(heap_host.mirror(buffer_view, at(buffer_view), true).is_some());
+        assert!(heap_host.kept(read) && heap_host.kept(buffer_view), "made for a draw");
+        let first = heap_host.host_page_of(read).unwrap();
+        crate::host::tests::without_submissions(|| {
+            crate::host::tests::take_back_all(heap_host, &mut std::time::Instant::now());
+        });
+        assert_eq!(heap_host.host_page_of(read), Some(0), "taken back");
+        // Page 2, written next, takes its host page.
+        let other = 2 * page + 7;
+        let _other = placed_texture_view(title_heap, other);
+        assert_eq!(heap_host.host_page_of(other), Some(first), "page 3's host page");
+        fill_view_heap(heap_host);
+        age_view_heap_pages(heap_host);
+        let shader = compile_cs(READ_MARK_SOURCE);
+        let mut made = Vec::new();
+        for _ in 0..4 {
+            submit_read(&shader, read);
+            made.push((heap_host.kept(read), heap_host.kept(buffer_view)));
+        }
+        unfill_view_heap(heap_host);
+        assert_eq!(
+            made, [(true, true); 4],
+            "the texture and the buffer view made after the first submission"
+        );
+        assert_eq!(heap_host.host_page_of(read), Some(first), "placed again");
+        assert_eq!(heap_host.host_page_of(other), Some(0), "page 2 taken back for it");
+        assert!(!heap_host.kept(unread), "a placed texture not read stays unmade");
+    }
+
+    /// Paged view heaps with no host page free, through `Host::execute`: a
+    /// placed texture a shader read while its page found no room (made in
+    /// the scratch page) is made in its page for the submission after the
+    /// next one that reads it, once another page is taken back for it.
+    #[test]
+    fn a_placed_texture_read_with_no_room_before_is_made_after_one_submission() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        let Some((title_heap, heap_host)) = crate::host::tests::paged_view_heap(6) else {
+            return;
+        };
+        let page = victory_shader::emit::VIEW_PAGE_SLOTS;
+        // Page 4 holds a texture made for a draw.
+        let other = 4 * page + 3;
+        let _other = placed_texture_view(title_heap, other);
+        let at = title_heap.start + u64::from(other) * 32;
+        assert!(heap_host.mirror(other, at, true).is_some());
+        let first = heap_host.host_page_of(other).unwrap();
+        assert_ne!(first, 0, "placed");
+        // Page 5's placed texture written and read with no host page free.
+        fill_view_heap(heap_host);
+        let read = 5 * page + 9;
+        let _read = placed_texture_view(title_heap, read);
+        assert_eq!(heap_host.host_page_of(read), Some(0), "no room for its page");
+        let shader = compile_cs(READ_MARK_SOURCE);
+        submit_read(&shader, read);
+        assert_eq!(heap_host.host_page_of(read), Some(0), "still no room");
+        assert!(!heap_host.kept(read), "made in the scratch page: the slot holds nothing");
+        age_view_heap_pages(heap_host);
+        let mut made = Vec::new();
+        for _ in 0..4 {
+            submit_read(&shader, read);
+            made.push(heap_host.kept(read));
+        }
+        unfill_view_heap(heap_host);
+        assert_eq!(made, [true; 4], "made after the first submission");
+        assert_eq!(heap_host.host_page_of(read), Some(first), "placed");
+        assert_eq!(heap_host.host_page_of(other), Some(0), "page 4 taken back for it");
     }
 
     fn buffer_at_address(address: u64, bytes: u64) -> This {

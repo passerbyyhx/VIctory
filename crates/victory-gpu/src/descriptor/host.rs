@@ -1156,7 +1156,11 @@ impl HostHeap {
                 null_for(&view, self.cpu(index));
             }
             // Made in the scratch page (no room for its page): the slot
-            // holds nothing, made again when its page is placed.
+            // holds nothing, made again when its page is placed; a placed
+            // texture's next read is taken again (`make_read`).
+            if !placed && is_placed_texture(&view) {
+                crate::shadow::forget_read(index);
+            }
             let kept = kept.filter(|_| placed);
             if !self.sampler {
                 self.viewed.set(index, Some(&view), kept.is_some());

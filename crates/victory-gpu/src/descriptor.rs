@@ -219,6 +219,7 @@ pub(crate) fn sync_heaps() {
 /// unused lately are taken back (`host::HostHeap::take_back_pages`). A page
 /// placed again has all its slots made from the title's records here, so a
 /// page taken back too early reads null for the submission that read it.
+/// Runs before [`make_read`], which makes the placed textures read there.
 #[cfg(windows)]
 pub(crate) fn turn_pages(read: &[u32], at: std::time::Instant) {
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());

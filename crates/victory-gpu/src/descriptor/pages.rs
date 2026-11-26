@@ -35,9 +35,10 @@ const HIGH_WATER: u32 = 16;
 /// submissions.
 const MIN_AGE_SUBMISSIONS: u32 = 300;
 const MIN_AGE: Duration = Duration::from_secs(10);
-/// Where a write found no host page since the last pass, pages unused for
-/// this many submissions are taken back too, however recently in time:
-/// more than a frame's submissions, so pages read every frame stay.
+/// Where a write or a page read again found no host page since the last
+/// pass, pages unused for this many submissions are taken back too,
+/// however recently in time: more than a frame's submissions, so pages
+/// read every frame stay.
 const PRESSED_AGE_SUBMISSIONS: u32 = 32;
 
 /// Diagnostics, `VICTORY_VIEW_PAGES_KEEP=1`: no page is taken back, so a
@@ -96,8 +97,8 @@ struct Placed {
     /// Pages written when no host page was left, and their slots written.
     refused: u32,
     refused_slots: u64,
-    /// Whether a write found no host page since the last pass of
-    /// [`Pages::take_back`].
+    /// Whether a write or a page read again found no host page since the
+    /// last pass of [`Pages::take_back`].
     pressed: bool,
     /// Whether the last pass took back pages younger than the strict ages,
     /// and pages taken back so by all passes.
@@ -347,9 +348,10 @@ impl Pages {
 
     /// After a submission: pages `read` (their read marks) were used now;
     /// those of them without a place whose slots the title has records for
-    /// are returned (to be placed again).
+    /// are returned (to be placed again). Where fewer host pages are free,
+    /// the next pass of [`Pages::take_back`] is pressed, as by a write.
     pub(super) fn read(&self, read: &[u32]) -> Vec<u32> {
-        let p = self.lock();
+        let mut p = self.lock();
         let mut again = Vec::new();
         for &page in read {
             let page = page as usize;
@@ -358,6 +360,10 @@ impl Pages {
                 again.push(page as u32);
             }
         }
+        let free = p.free.len() + (self.end - p.next) as usize;
+        if again.len() > free {
+            p.pressed = true;
+        }
         again
     }
 
@@ -365,8 +371,8 @@ impl Pages {
     /// mark are free, pages placed on a write that hold title slots only
     /// and were last used `MIN_AGE_SUBMISSIONS` submissions and `MIN_AGE`
     /// ago or more are taken back, least recently used first, up to the
-    /// high-water mark. Where a write found no host page since the last
-    /// pass, pages last used `PRESSED_AGE_SUBMISSIONS` submissions ago or
+    /// high-water mark. Where a write or a page read again found no host
+    /// page since the last pass, pages last used `PRESSED_AGE_SUBMISSIONS` submissions ago or
     /// more are taken back too, after the older ones. Each reads the null
     /// page from now, its slots to be made again when it is placed again.
     /// Returns them and their host pages, which go back to [`Pages::give`]
@@ -490,14 +496,23 @@ impl Pages {
     /// held so (tests).
     #[cfg(test)]
     pub(super) fn hold_room(&self, none: bool) {
-        static HELD: Mutex<Option<(u32, Vec<u32>)>> = Mutex::new(None);
+        // Per heap (its pages' address).
+        static HELD: Mutex<Vec<(usize, u32, Vec<u32>)>> = Mutex::new(Vec::new());
         let mut p = self.lock();
         let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+        let me = self as *const Self as usize;
+        let at = held.iter().position(|h| h.0 == me);
         if none {
-            *held = Some((p.next, std::mem::take(&mut p.free)));
+            let free = std::mem::take(&mut p.free);
+            match at {
+                Some(at) => held[at].2.extend(free),
+                None => held.push((me, p.next, free)),
+            }
             p.next = self.end;
-        } else if let Some((next, free)) = held.take() {
-            (p.next, p.free) = (next, free);
+        } else if let Some(at) = at {
+            let (_, next, free) = held.swap_remove(at);
+            p.next = next;
+            p.free.extend(free);
         }
     }
 }
@@ -827,5 +842,38 @@ mod tests {
         assert_eq!(pages.slot(at(7, 0), true), None, "no room");
         t += MS;
         assert_eq!(pages.take_back(t), [(3, 5), (4, 6), (5, 7)]);
+    }
+
+    /// A page read again with no host page free presses the next pass, as
+    /// a write refused room does: a page unused for `PRESSED_AGE_SUBMISSIONS`
+    /// submissions is taken back, and the page read placed in its host page.
+    #[test]
+    fn a_page_read_again_with_no_room_presses_the_next_pass() {
+        let mut table = vec![0u32; PAGES];
+        // Host pages 2-3.
+        let pages = pages(&mut table, 4);
+        pages.set_water(0, 0);
+        pages.slot(at(0, 0), true);
+        pages.slot(at(1, 0), true);
+        let mut t = Instant::now();
+        run(&pages, &mut t, MIN_AGE_SUBMISSIONS + 20, SECOND);
+        // Page 1 taken back; page 2, written next, takes its host page.
+        pages.stamp(at(0, 0));
+        pages.set_water(1, 1);
+        t += SECOND;
+        assert_eq!(pages.take_back(t), [(1, 3)]);
+        pages.give(&[3]);
+        assert_eq!(pages.slot(at(2, 0), true), Some(at(3, 0)));
+        pages.set_water(0, 0);
+        run(&pages, &mut t, PRESSED_AGE_SUBMISSIONS + 1, MS);
+        pages.set_water(1, 1);
+        t += MS;
+        assert!(pages.take_back(t).is_empty(), "none old by the strict ages");
+        assert_eq!(pages.read(&[1]), [1]);
+        t += MS;
+        assert_eq!(pages.take_back(t), [(0, 2)], "the page unused longest");
+        pages.give(&[2]);
+        assert!(pages.place(1));
+        assert_eq!(pages.host_page(1), 2);
     }
 }

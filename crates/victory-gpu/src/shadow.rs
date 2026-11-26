@@ -837,15 +837,28 @@ unsafe fn read_maps<'a>() -> Vec<&'a mut [u32]> {
         .collect()
 }
 
+/// Read marks cleared by [`clear_forgotten`] before [`reads_since`] took
+/// them, a bit per slot: still reads since its last call.
+static CLEARED: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
 /// Clears the read marks of the slots forgotten ([`forget_read`]) since
-/// the last call.
+/// the last call. Marks are by slot, whatever the heap: one set is kept for
+/// [`reads_since`] (another heap's shader may have read the slot).
 fn clear_forgotten(maps: &mut [&mut [u32]], seen: &mut Vec<u32>, forgotten: &mut Vec<u32>) {
     let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
     seen.resize(words, 0);
+    if forgotten.is_empty() {
+        return;
+    }
+    let mut cleared = CLEARED.lock().unwrap_or_else(|e| e.into_inner());
+    cleared.resize(words, 0);
     for slot in forgotten.drain(..) {
         let (w, bit) = ((slot / 32) as usize, 1u32 << (slot % 32));
         if w < words {
-            maps.iter_mut().for_each(|bits| bits[w] &= !bit);
+            for bits in maps.iter_mut() {
+                cleared[w] |= bits[w] & bit;
+                bits[w] &= !bit;
+            }
             seen[w] &= !bit;
         }
     }
@@ -890,7 +903,8 @@ pub(crate) fn take_reads() -> Vec<u32> {
 }
 
 /// The heap slots shaders read texture views at since the last call (both
-/// bitmaps), whose marks are cleared: what the title used (eviction stamps,
+/// bitmaps, and marks forgotten meanwhile), whose marks are cleared: what
+/// the title used (eviction stamps,
 /// `crate::resource::evict`). Between submissions, after [`take_reads`]
 /// has seen every mark: its own record of slots seen keeps a slot read
 /// again from being reported as new.
@@ -898,11 +912,12 @@ pub(crate) fn reads_since() -> Vec<u32> {
     let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
     let first = (victory_shader::emit::VIEW_READS / 32) as usize;
     let mut slots = Vec::new();
+    let cleared = std::mem::take(&mut *CLEARED.lock().unwrap_or_else(|e| e.into_inner()));
     for b in [false, true].into_iter().filter_map(bitmap) {
         // SAFETY: the mapped bitmap's read marks; no submission runs.
         let bits = unsafe { std::slice::from_raw_parts_mut((b.data as *mut u32).add(first), words) };
         for (w, word) in bits.iter_mut().enumerate() {
-            let mut x = std::mem::take(word);
+            let mut x = std::mem::take(word) | cleared.get(w).copied().unwrap_or(0);
             while x != 0 {
                 slots.push(w as u32 * 32 + x.trailing_zeros());
                 x &= x - 1;
