@@ -1,4 +1,4 @@
-use super::{A, HostHeap};
+use super::HostHeap;
 use crate::descriptor::{self, HEAP_IIDS, HeapDesc, Placement, SHADER_VISIBLE, VIEWS_KIND};
 use crate::host::Host;
 use crate::object::{S_OK, This, slot};
@@ -121,8 +121,8 @@ impl RegisteredTextures {
         super::Colors::from_textures(texture(&self.red), texture(&self.blue))
     }
 
-    pub(super) fn write_red_a(&self) {
-        self.write(A, self.red.0, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+    pub(super) fn write_red(&self, slot: u32) {
+        self.write(slot, self.red.0, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
     }
 
     pub(super) fn write_green(&self, slot: u32) {

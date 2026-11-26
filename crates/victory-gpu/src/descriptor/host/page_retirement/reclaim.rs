@@ -41,7 +41,7 @@ fn age(host: &Host, heap: &HostHeap, fillers: &[u32], resident: u32, original: u
     );
 }
 
-pub(super) fn check(host: &Host, title_slots: u32) {
+pub(super) fn check(host: &Host, title_slots: u32, write_b_neighbor: bool) {
     let control_slot = title_slots + 7;
     let output_slot = control_slot + 1;
     let slots = [A, B, control_slot];
@@ -52,7 +52,8 @@ pub(super) fn check(host: &Host, title_slots: u32) {
     let placements = || slots.map(|slot| placement(heap, slot));
     let pages = heap.pages.as_ref().expect("paged title heap");
     let colors = source.colors();
-    source.write_red_a();
+    source.write_red(A);
+    source.write_red(A + 1);
     colors.bind_blue(host, heap.cpu(control_slot));
     let (out, mapped) = host.shared_buffer(16).unwrap();
     let output_view = D3D12_UNORDERED_ACCESS_VIEW_DESC {
@@ -102,6 +103,12 @@ pub(super) fn check(host: &Host, title_slots: u32) {
     assert_eq!(full.0, 0, "full physical heap");
     assert_eq!((full.2, full.3, full.4), (0, 0, 0));
     source.write_green(B);
+    let b_neighbor = if write_b_neighbor {
+        source.write_green(B + 1);
+        GREEN
+    } else {
+        NULL
+    };
     // A second distinct refused page triggers the allocator's incremental
     // overflow message. It gets a title record but no shader ever requests it.
     source.write_green(unread);
@@ -115,7 +122,23 @@ pub(super) fn check(host: &Host, title_slots: u32) {
     let (first, first_pixels) = colors.record_with(host, heap, slots, |list| {
         record_read(list, heap, &red, output_slot)
     });
-    host.execute(&[&first]);
+    // Both lists share one submission so the additional probe leaves the
+    // page-age and fence boundaries of the original round trip unchanged.
+    let pair_slots = |slot| [slot, slot + 1, control_slot];
+    let check_pair = |owner, slot, pixels: &super::colors::Readback, expected| {
+        let pair = pair_slots(slot);
+        let mapped = pair.map(|s| placement(heap, s));
+        assert_eq!(mapped, [Some(original), Some(original + 1), Some(control)]);
+        let rgba = pixels.checked_colors(pair, mapped);
+        eprintln!(
+            "{owner}: occupied slot and adjacent slot = {:?} / {:?}; control = {:?}",
+            rgba[0], rgba[1], rgba[2]
+        );
+        assert_eq!(rgba, expected, "{owner}: same-page neighbor");
+    };
+    let (first_pair, first_pair_pixels) = colors.record(host, heap, pair_slots(A));
+    host.execute(&[&first, &first_pair]);
+    check_pair("A before reuse", A, &first_pair_pixels, [RED, RED, BLUE]);
     assert_eq!(output(), [1., 0., 0., 1.]);
     assert_eq!(
         first_pixels.checked_colors(slots, placements()),
@@ -163,14 +186,16 @@ pub(super) fn check(host: &Host, title_slots: u32) {
         eprintln!("translated demand for unmapped virtual slot {slot} returned {rgba:?}");
         assert_eq!(rgba, [0.; 4], "first demand before the slot was remade");
     };
-    let sample_restored = |pipeline| {
+    let sample_restored = |pipeline, slot, owner, expected_pair| {
         clear_output();
         // Only the translated load sets a page-read mark. The independent
         // three-color probe echoes the page table and pixels into a fresh readback.
         let (list, pixels) = colors.record_with(host, heap, slots, |list| {
             record_read(list, heap, pipeline, output_slot)
         });
-        host.execute(&[&list]);
+        let (pair, pair_pixels) = colors.record(host, heap, pair_slots(slot));
+        host.execute(&[&list, &pair]);
+        check_pair(owner, slot, &pair_pixels, expected_pair);
         let translated = output();
         eprintln!("translated read after placement: {translated:?}");
         let sampled = pixels.checked_colors(slots, placements());
@@ -187,7 +212,7 @@ pub(super) fn check(host: &Host, title_slots: u32) {
         (0, full.1, 1, 0, 1),
         "B was refused on its first write"
     );
-    let b_readback = sample_restored(&green);
+    let b_readback = sample_restored(&green, B, "B after reuse", [GREEN, b_neighbor, BLUE]);
     eprintln!("B={B} reused physical {original}; counts={after_b:?}");
 
     age(host, heap, &fillers, B, original);
@@ -199,7 +224,7 @@ pub(super) fn check(host: &Host, title_slots: u32) {
         (0, full.1, 2, 1, 1),
         "A was resident before the allocator took it back"
     );
-    let a_readback = sample_restored(&red);
+    let a_readback = sample_restored(&red, A, "A after reuse", [RED, RED, BLUE]);
     assert_eq!(heap.page_table_entry(unread / PAGE), 0);
     eprintln!(
         "A={A} regained physical {original}; unused slot {unread} still unmapped; counts={after_a:?}"
