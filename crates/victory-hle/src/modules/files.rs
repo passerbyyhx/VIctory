@@ -1097,3 +1097,7 @@ mod tests {
         assert!(bps > 0 && spc > 0 && total > 0);
     }
 }
+
+#[cfg(test)]
+#[path = "ten_real_paths.rs"]
+mod ten_real_paths;
