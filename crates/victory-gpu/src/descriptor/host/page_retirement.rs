@@ -56,8 +56,9 @@ fn report_adapter(host: &Host) {
         .position(|&c| c == 0)
         .unwrap_or(desc.Description.len());
     eprintln!(
-        "D3D12 adapter: {}",
-        String::from_utf16_lossy(&desc.Description[..length])
+        "D3D12 adapter: {} ({:04x}:{:04x}) LUID={:08x}:{:08x}",
+        String::from_utf16_lossy(&desc.Description[..length]),
+        desc.VendorId, desc.DeviceId, desc.AdapterLuid.HighPart, desc.AdapterLuid.LowPart
     );
 }
 
@@ -195,6 +196,20 @@ fn expect_reuse_under_short_pressure() {
 #[ignore = "requires a paged D3D12 device and pressure-triggered page reclamation"]
 fn expect_reuse_under_short_pressure_at_paged_title_limit() {
     expect_reuse(super::PAGED_TITLE_VIEWS, reclaim::Age::Pressured);
+}
+
+#[test]
+#[ignore = "requires paged D3D12 and VICTORY_VIEW_PAGES_KEEP=1"]
+fn keep_control_under_pressure() {
+    assert!(crate::switch::on("VICTORY_VIEW_PAGES_KEEP"));
+    expect_reuse(1 << 20, reclaim::Age::Kept);
+}
+
+#[test]
+#[ignore = "requires paged D3D12 and VICTORY_VIEW_PAGES_KEEP=1"]
+fn keep_control_under_pressure_at_paged_title_limit() {
+    assert!(crate::switch::on("VICTORY_VIEW_PAGES_KEEP"));
+    expect_reuse(super::PAGED_TITLE_VIEWS, reclaim::Age::Kept);
 }
 
 fn expect_reuse(title_slots: u32, age: reclaim::Age) {

@@ -521,6 +521,7 @@ pub(crate) mod tests {
         crate::shadow::tests::mark_read(false, slot);
         crate::descriptor::make_read(&crate::shadow::take_reads());
         assert!(heap_host.kept(slot), "its texture made");
+        eprintln!("author restoration complete: slot={slot}, original page={placed}, restored page={again}");
     }
 
     /// The textures shaders read through the heap since the last eviction

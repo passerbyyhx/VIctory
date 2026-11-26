@@ -1062,6 +1062,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(read(), [0x300, 0x301, 0x302, 0x303, 0x400, 0x401, 0x402, 0x403]);
         assert_eq!((pair_of(OURS, &a).unwrap(), pair_of(OURS, &b).unwrap()), pairs, "views kept");
         assert!(pair_of(OURS, &c).is_some());
+        eprintln!("shared table complete: dynamic_end={end}, first two pairs={pairs:?}, third={:?}", pair_of(OURS, &c));
         for (&p, copy) in memory.iter().zip([a, b, c]) {
             crate::shadow::unregister(p, p as u64);
             drop(copy);

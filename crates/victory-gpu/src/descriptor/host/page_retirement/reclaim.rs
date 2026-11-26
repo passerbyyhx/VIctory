@@ -46,6 +46,7 @@ fn age(host: &Host, heap: &HostHeap, fillers: &[u32], resident: u32, original: u
 pub(super) enum Age {
     Strict,
     Pressured,
+    Kept,
 }
 
 /// Leave every filler hot. Inspect the resident's real submission stamp without
@@ -75,6 +76,12 @@ pub(super) fn check(host: &Host, title_slots: u32, policy: Age) {
     let unread = (title_slots / PAGE - 1) * PAGE + 7;
     let source = RegisteredTextures::new(host, title_slots);
     let heap = source.host_heap();
+    assert_eq!(heap.count(), title_slots);
+    let end = heap.dynamic_end();
+    assert_eq!(end - title_slots, super::super::MIN_DYNAMIC);
+    assert!(output_slot < end && end < victory_shader::emit::NULL_BUFFER_VIEW);
+    eprintln!("title capacity={title_slots}, dynamic slots={}, end={end}, null buffer={}",
+        end - title_slots, victory_shader::emit::NULL_BUFFER_VIEW);
     let placements = || slots.map(|slot| placement(heap, slot));
     let pages = heap.pages.as_ref().expect("paged title heap");
     let colors = source.colors();
@@ -153,7 +160,7 @@ pub(super) fn check(host: &Host, title_slots: u32, policy: Age) {
 
     match policy {
         Age::Strict => age(host, heap, &fillers, A, original),
-        Age::Pressured => idle_until_age(host, heap, &fillers, A, 31),
+        Age::Pressured | Age::Kept => idle_until_age(host, heap, &fillers, A, 31),
     }
     clear_output();
     let (old, old_pixels) = colors.record_with(host, heap, slots, |list| {
@@ -248,6 +255,21 @@ pub(super) fn check(host: &Host, title_slots: u32, policy: Age) {
     let after_b = pages.counts();
     let b_mapping = placements();
     let b_readback = sample_restored(&green);
+    if matches!(policy, Age::Kept) {
+        let expected = ([0.; 4], [RED, NULL, BLUE]);
+        assert_eq!(b_mapping, [Some(original), None, Some(control)]);
+        assert_eq!(after_b, full);
+        assert_eq!(b_readback, expected);
+        eprintln!("KEEP after renewed short pressure: {:?}, counts={after_b:?}", b_readback.1);
+        age(host, heap, &fillers, A, original);
+        demand_missing(B, &green);
+        assert_eq!(placements(), b_mapping);
+        assert_eq!(pages.counts(), full);
+        assert_eq!(sample_restored(&green), expected);
+        assert_eq!(heap.page_table_entry(unread / PAGE), 0);
+        eprintln!("KEEP after strict age: A={original}, B unmapped, blue control={control}, counts={full:?}");
+        return;
+    }
     if let Some(start) = under_pressure {
         eprintln!(
             "short A->B: {b_mapping:?}, A/B/control={:?}, counts={after_b:?}, elapsed={:?}",
