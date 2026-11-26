@@ -898,6 +898,7 @@ impl HostHeap {
         let host = host();
         for &(page, host_page) in &taken {
             for index in page * PAGE..((page + 1) * PAGE).min(self.count) {
+                self.ready[index as usize].store(0, Ordering::Relaxed);
                 self.keep(index, None);
                 self.set_mark(index, None);
                 self.viewed.set(index, None, false);
@@ -943,7 +944,13 @@ impl HostHeap {
             .into_iter()
             .map(|page| (page * PAGE, ((page + 1) * PAGE).min(self.count)))
             .filter(|&(first, last)| first < last)
-            .inspect(|&(first, last)| made[first as usize..last as usize].fill(REMAKE))
+            .inspect(|&(first, last)| {
+                let slots = first as usize..last as usize;
+                for ready in &self.ready[slots.clone()] {
+                    ready.store(0, Ordering::Relaxed);
+                }
+                made[slots].fill(REMAKE);
+            })
             .collect()
     }
 
