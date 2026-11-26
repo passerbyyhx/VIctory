@@ -3305,6 +3305,9 @@ mod tests {
         // Every dynamic slot can be taken; title slots past the cap have none.
         assert_eq!(heap.dynamic(heap.dynamic), Some(heap.count()));
         assert_eq!(heap.mirror(heap.count(), 0, false), None);
+        // SAFETY: the host device owns this heap.
+        let luid = unsafe { host().unwrap().device.GetAdapterLuid() };
+        eprintln!("paged cap reached: title={} dynamic={} end={end} LUID={:08x}:{:08x}", heap.count(), heap.dynamic, luid.HighPart, luid.LowPart);
     }
 
     /// A texture view's size words are the console image descriptor's

@@ -1132,6 +1132,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(read(), [0x300, 0x301, 0x302, 0x303, 0x400, 0x401, 0x402, 0x403]);
         assert_eq!((pair_of(OURS, &a).unwrap(), pair_of(OURS, &b).unwrap()), pairs, "views kept");
         assert!(pair_of(OURS, &c).is_some());
+        // SAFETY: both submissions completed on this live device.
+        let luid = unsafe { host.device.GetAdapterLuid() };
+        eprintln!("shared views retained: pairs={pairs:?} dynamic_end={end} LUID={:08x}:{:08x}", luid.HighPart, luid.LowPart);
         for (&p, copy) in memory.iter().zip([a, b, c]) {
             crate::shadow::unregister(p, p as u64);
             drop(copy);
