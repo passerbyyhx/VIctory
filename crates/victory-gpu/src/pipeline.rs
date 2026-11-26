@@ -125,6 +125,14 @@ pub(crate) struct Translated {
     pub(crate) used: Vec<victory_shader::UsedResource>,
 }
 
+/// Build the runtime's compute root signature and pipeline for a synthetic native program.
+#[cfg(all(test, windows))]
+pub(crate) fn test_compute_stage(translation: Translated) -> host::HostPipeline {
+    let shader = Shader::new("compute", &translation.host.dxil);
+    assert!(shader.translated.set(Some(translation)).is_ok());
+    host::HostPipeline::new(&[Arc::new(shader)], None).expect("synthetic compute pipeline")
+}
+
 #[cfg(windows)]
 impl Shader {
     /// The translation, made on first use (or taken from the cache); a

@@ -783,6 +783,9 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
 }
 
 #[cfg(test)]
+pub(crate) use tests::pipeline as test_page_table_pipeline;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -971,7 +974,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
-    fn pipeline(source: &str) -> (
+    pub(crate) fn pipeline(source: &str) -> (
         windows::Win32::Graphics::Direct3D12::ID3D12RootSignature,
         windows::Win32::Graphics::Direct3D12::ID3D12PipelineState,
     ) {

@@ -19,6 +19,7 @@ victory-shader = { workspace = true, features = ["host"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+victory-core.workspace = true
 
 [target.'cfg(windows)'.dev-dependencies]
 windows = { workspace = true, features = ["Win32_Graphics_Direct3D_Dxc"] }

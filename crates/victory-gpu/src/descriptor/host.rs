@@ -2382,6 +2382,9 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 }
 
 #[cfg(test)]
+mod page_retirement;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
