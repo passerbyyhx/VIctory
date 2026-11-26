@@ -21,7 +21,8 @@ fn age(host: &Host, heap: &HostHeap, fillers: &[u32], resident: u32, original: u
     let empty = host.new_list().unwrap();
     empty.close();
     for i in 0..299 {
-        if i % 100 == 0 {
+        if i % 16 == 0 {
+            // Keep the filler pages inside the 32-submission pressure window.
             // Request handles just as a command binding those other pages would.
             for &slot in fillers {
                 heap.gpu(slot);
