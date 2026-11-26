@@ -7,6 +7,7 @@ mod placed_retry;
 mod reclaim;
 mod registered_textures;
 mod translated_reads;
+mod shared_read_window;
 
 use super::{HostHeap, PAGE, view_pages};
 use crate::host::test_submission::while_pending;
