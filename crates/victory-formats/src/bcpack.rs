@@ -1486,6 +1486,176 @@ mod tests {
         assert_eq!(dst, [144, 0, 0, 0, 0, 0, 4, 0, 0, 0, 6, 0, 0, 0, 0, 0]);
     }
 
+    /// Emits synthetic BCPack inputs' resulting BC7 blocks for tests/bcpack_pixels.py.
+    /// The Python driver checks all 16 RGBA pixels using an independent decoder.
+    #[test]
+    fn bc7_pixel_fixture() {
+        const WIDTHS: [u8; 16] = [3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4];
+        const CTRL_OFFSET: usize = MODELS * BUCKETS * 2 + 256 + 64 + 256 + 64 + 64;
+        const ENTRY_SIZE: usize = 116;
+        const DICT_OFFSET: usize = TABLES_SIZE - DICTIONARY * ENTRY_SIZE;
+        const SET0: [usize; 4] = [22, 24, 26, 28];
+        const SET1: [usize; 4] = [12, 14, 16, 20];
+        const SHORT: [[u8; 16]; 2] = [
+            [1, 0, 3, 2, 2, 1, 0, 3, 0, 3, 2, 1, 3, 2, 1, 0],
+            [0, 2, 1, 3, 3, 0, 2, 3, 3, 1, 3, 2, 0, 2, 0, 1],
+        ];
+        const LONG: [[u8; 16]; 2] = [
+            [3, 7, 2, 6, 1, 4, 0, 5, 6, 2, 7, 3, 0, 5, 4, 1],
+            [2, 1, 5, 0, 4, 2, 3, 7, 7, 6, 1, 4, 5, 0, 6, 3],
+        ];
+        const MODE4: [[u8; 8]; 2] = [[3, 27, 24, 5, 8, 22, 47, 9], [30, 4, 9, 21, 25, 1, 12, 58]];
+        const MODE5: [[u8; 8]; 2] = [
+            [17, 111, 102, 13, 31, 94, 231, 41],
+            [120, 5, 27, 103, 68, 19, 33, 219],
+        ];
+
+        fn encode_indices(record: &mut [u8], offsets: [usize; 4], pixels: &[u8; 16]) {
+            // Each residual occupies a four-bit zigzag symbol. Represent the
+            // upper half of the 4-bit index range as negative residuals.
+            let residual = |v| zigzag(i32::from(v) - if v >= 8 { 16 } else { 0 });
+            for (group, offset) in offsets.into_iter().enumerate() {
+                for pair in 0..2 {
+                    let first = residual(pixels[4 * group + 2 * pair]);
+                    let second = residual(pixels[4 * group + 2 * pair + 1]);
+                    let (even, odd) = if group == 3 {
+                        (first, second)
+                    } else {
+                        (second, first)
+                    };
+                    record[offset + pair] = (0..4).fold(0, |acc, bit| {
+                        acc | (even >> bit & 1) << (2 * bit) | (odd >> bit & 1) << (2 * bit + 1)
+                    });
+                }
+            }
+        }
+
+        fn hex(bytes: &[u8]) -> String {
+            use std::fmt::Write;
+            let mut out = String::with_capacity(2 * bytes.len());
+            for byte in bytes {
+                write!(out, "{byte:02x}").unwrap();
+            }
+            out
+        }
+
+        let emit = |label: &str,
+                    ctrl: u16,
+                    rotation: usize,
+                    endpoints: [u8; 8],
+                    primary: &[u8; 16],
+                    secondary: &[u8; 16],
+                    dictionary: Option<usize>| {
+            let mode = ctrl & 7;
+            let selector = (ctrl >> 5) & 1;
+            let mut raw = tables();
+            raw[CTRL_OFFSET..CTRL_OFFSET + 2].copy_from_slice(&ctrl.to_le_bytes());
+            let mut record = vec![0; 32];
+
+            let mut stored = endpoints;
+            if rotation != 0 {
+                stored.swap(2 * (rotation - 1), 6);
+                stored.swap(2 * (rotation - 1) + 1, 7);
+            }
+            if mode == 6 {
+                // Only the red endpoint pairs store the shared per-endpoint p-bit.
+                for value in &mut stored[2..] {
+                    *value >>= 1;
+                }
+            }
+            for (symbol, value) in record[4..12].iter_mut().zip(stored) {
+                *symbol = zigzag(i32::from(value as i8));
+            }
+            if let Some(entry) = dictionary {
+                // First decoded block: ix_ref = entry + 1, ep_ref = 0.
+                record[..4].copy_from_slice(if entry == 0 {
+                    &[1, 0, 1, 0]
+                } else {
+                    &[1, 1, 0, 1]
+                });
+                let at = DICT_OFFSET + entry * ENTRY_SIZE + 50;
+                raw[at..at + 2].copy_from_slice(&[2, 0]);
+                let mut at = at + 2;
+                if entry != 0 {
+                    raw[at..at + 2].copy_from_slice(&[2, 0]); // repeated widths
+                    at += 2;
+                }
+                for (slot, &value) in raw[at..at + 32]
+                    .as_chunks_mut::<2>()
+                    .0
+                    .iter_mut()
+                    .zip(primary)
+                {
+                    *slot = i16::from(value).to_le_bytes();
+                }
+            } else {
+                encode_indices(&mut record, if mode == 4 { SET1 } else { SET0 }, primary);
+            }
+            if mode != 6 {
+                encode_indices(&mut record, if mode == 4 { SET0 } else { SET1 }, secondary);
+            }
+            let parsed = Tables::parse(&raw).unwrap();
+            let src = stream(&parsed, &WIDTHS, 2, &[record]);
+            let mut block = [0; 16];
+            decode(7, &src, &mut block, &parsed).unwrap();
+            println!(
+                "BC7PIXELS {label} {mode} {rotation} {selector} {} {} {} {}",
+                hex(&endpoints),
+                hex(primary),
+                hex(secondary),
+                hex(&block),
+            );
+        };
+
+        for variant in 0..2 {
+            for rotation in 0..4 {
+                let ctrl = (1 << 6) | ((rotation as u16) << 3);
+                for selector in 0..2 {
+                    emit(
+                        &format!("dual{variant}"),
+                        ctrl | 4 | selector << 5,
+                        rotation,
+                        MODE4[variant],
+                        &SHORT[variant],
+                        &LONG[variant],
+                        None,
+                    );
+                }
+                emit(
+                    &format!("dual{variant}"),
+                    ctrl | 5,
+                    rotation,
+                    MODE5[variant],
+                    &SHORT[variant],
+                    &SHORT[1 - variant],
+                    None,
+                );
+            }
+        }
+        for bogus in 0..4 {
+            emit(
+                &format!("guard{bogus}"),
+                0x46 | bogus << 3,
+                0,
+                [19, 236, 205, 34, 63, 172, 217, 78],
+                &[3, 15, 6, 12, 7, 3, 8, 1, 14, 0, 11, 5, 4, 13, 2, 9],
+                &[0; 16],
+                None,
+            );
+        }
+        for entry in 0..2 {
+            emit(
+                &format!("dict{entry}"),
+                0x45,
+                0,
+                MODE5[0],
+                &SHORT[0],
+                &SHORT[1],
+                Some(entry),
+            );
+        }
+    }
+
     #[test]
     fn malformed_input_is_an_error() {
         let t = Tables::parse(&tables()).unwrap();
