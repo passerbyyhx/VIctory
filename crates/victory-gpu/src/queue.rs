@@ -629,6 +629,17 @@ fn holds(frame: u64, planes: &[Plane]) -> bool {
     }
 }
 
+#[cfg(all(test, windows))]
+pub(crate) fn present_for_pipeline_probe(frame: u64, image: usize) -> bool {
+    let image = image as This;
+    holds(frame, &[Plane {
+        token: frame,
+        count: 1,
+        resources: std::ptr::from_ref(&image),
+        _rest: [0; 6],
+    }])
+}
+
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.
 #[cfg(all(windows, feature = "diagnostics"))]

@@ -329,6 +329,8 @@ fn queue(p: Arc<Pending>, at: Place) {
     static WORKERS: OnceLock<usize> = OnceLock::new();
     let workers = *WORKERS.get_or_init(|| {
         let n = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        #[cfg(test)]
+        let n = if two_frame_probe::WORKER.get().is_some() { 1 } else { n };
         (0..n)
             .filter(|i| {
                 let spawned = std::thread::Builder::new()
@@ -385,6 +387,8 @@ fn work() {
         if p.taken.swap(true, Ordering::Relaxed) {
             continue; // its other queue entry
         }
+        #[cfg(test)]
+        two_frame_probe::pause(&p);
         p.make();
         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
             drained();
@@ -393,6 +397,9 @@ fn work() {
         }
     }
 }
+
+#[cfg(test)]
+mod two_frame_probe;
 
 /// The most pipelines waiting at once since the workers last ran out.
 static PEAK: AtomicU64 = AtomicU64::new(0);
