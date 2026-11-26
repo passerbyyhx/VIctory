@@ -1718,3 +1718,7 @@ pub(crate) mod tests {
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
     }
 }
+
+#[cfg(test)]
+#[path = "ten_snapshot_pool.rs"]
+mod ten_snapshot_pool;
