@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType><TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable>
+    <VSPrivate Condition="'$(VSPrivate)'==''">$(ProgramW6432)\Microsoft Visual Studio\2022\Enterprise\Common7\IDE\PrivateAssemblies</VSPrivate>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="Microsoft.Diagnostics.Tracing.TraceEvent"><HintPath>$(VSPrivate)\Microsoft.Diagnostics.Tracing.TraceEvent.dll</HintPath></Reference>
+    <Reference Include="Microsoft.Diagnostics.FastSerialization"><HintPath>$(VSPrivate)\Microsoft.Diagnostics.FastSerialization.dll</HintPath></Reference>
+    <Reference Include="Dia2Lib"><HintPath>$(VSPrivate)\Dia2Lib.dll</HintPath></Reference>
+    <Reference Include="TraceReloggerLib"><HintPath>$(VSPrivate)\TraceReloggerLib.dll</HintPath></Reference>
+  </ItemGroup>
+</Project>

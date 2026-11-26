@@ -1,0 +1,11 @@
+# Four-worker XMA scheduler study
+
+This fixture processes Windows kernel scheduler events for the synthetic short-voice workload. Use the [parent workload](https://github.com/passerbyyhx/VIctory/commit/badfc3f7c2a50ff5648e2f60a67318f65f5ea5db) and [revision workload](https://github.com/passerbyyhx/VIctory/commit/ce2b00ec0225b546c61148bb1fa05107b0b42b57) with Release debug information. Keep the binaries and matching PDBs as `base-time.exe/.pdb` and `head-time.exe/.pdb` in a private directory.
+
+1. Capture one binary at a time using the Windows Performance Recorder profile `wait.wprp!XmaWait` in file mode. Run the exact ignored test `modules::audio::voice_bench::xma_short_voice_cpu_bench` with `--test-threads=1`, `VI3_AUDIO_WORKERS=4`, `VI3_AUDIO_MODE=full`, and `VI3_AUDIO_ROUNDS=4096`. Save `base.etl` and `head.etl` in a private directory and record each process ID.
+2. Build `WaitStacks.csproj` with .NET 9. Point MSBuild property `VSPrivate` at a directory containing the matching TraceEvent 3.1.9 and dependency assemblies if Visual Studio is installed elsewhere. For each revision run `WaitStacks.exe PATH_TO_ETL PID` and save stdout as `base-analysis.log` or `head-analysis.log` beside that ETL.
+3. Run `python symbols.py base TRACE_DIR BIN_DIR` and repeat with `head`. This resolves the benchmark's offsets using Windows DbgHelp and its original PDB. The classifier uses only benchmark frames for site attribution.
+4. Run `python classify.py TRACE_DIR`. The two waits tables sum thread milliseconds spent waiting before wakeup and ready before execution. Waker, quality, roles and site tables allow inspection of individual classifications.
+
+The classifier uses the common lifetime of the last four scoped benchmark workers. The test executes its preflight and warmup in earlier sets of scoped threads. The pump is identified by a blocking frame at the timed call in the referenced workload (`voice_bench.rs:442`). The classifier checks the identities against stacks and fails if role identification changes. Open intervals at the window boundary and switches from non-waiting states are counted separately. For a blocking site, the extractor reads the departing thread's `BlockingStack()`. [TraceEvent implementation](https://github.com/microsoft/perfview/blob/main/src/TraceEvent/TraceLog.cs)
+
