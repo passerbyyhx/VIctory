@@ -1284,45 +1284,57 @@ mod host {
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
-        type Schedule = Vec<Scripted>;
-        static SCRIPT: LazyLock<(Instant, Schedule)> = LazyLock::new(|| {
+        static SCRIPT: LazyLock<(Instant, Vec<Scripted>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
-            let keys = list.split(',').filter_map(|entry| {
-                let mut parts = entry.split(':');
-                let (at, key) = (parts.next()?, parts.next()?);
-                let hold = parts
-                    .next()
-                    .and_then(|ms| ms.trim().parse::<u64>().ok())
-                    .map_or(Duration::from_millis(200), Duration::from_millis);
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
-                Some((
-                    Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
-                    hold,
-                    vk,
-                ))
-            });
+            let keys = parse_script(&list);
             (Instant::now(), keys.collect())
         });
         let (start, keys) = &*SCRIPT;
-        let now = start.elapsed();
+        active_script(keys, start.elapsed())
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn parse_script(list: &str) -> impl Iterator<Item = Scripted> + '_ {
+        list.split(',').filter_map(|entry| {
+            let mut parts = entry.split(':');
+            let (at, key) = (parts.next()?, parts.next()?);
+            let hold = parts
+                .next()
+                .and_then(|ms| ms.trim().parse::<u64>().ok())
+                .map_or(Duration::from_millis(200), Duration::from_millis);
+            let vk = match key.trim() {
+                "Enter" => 0x0D,
+                "Esc" => 0x1B,
+                "Tab" => 0x09,
+                "Back" => 0x08,
+                "Up" => 0x26,
+                "Down" => 0x28,
+                "Left" => 0x25,
+                "Right" => 0x27,
+                k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+                    k.as_bytes()[0].to_ascii_uppercase()
+                }
+                _ => return None,
+            };
+            Some((
+                Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
+                hold,
+                vk,
+            ))
+        })
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn active_script(keys: &[Scripted], now: Duration) -> Vec<u8> {
         keys.iter()
             .filter(|&&(at, hold, _)| (at..at + hold).contains(&now))
             .map(|&(_, _, vk)| vk)
             .collect()
     }
+
+    #[cfg(all(test, feature = "diagnostics"))]
+    #[path = "ten_keys_clock.rs"]
+    mod ten_keys_clock;
 
     /// The foreground window is one of ours (the title's or our fallback).
     fn focused() -> bool {
