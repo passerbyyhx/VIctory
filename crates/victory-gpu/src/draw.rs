@@ -2086,6 +2086,91 @@ void main() {
 }
 "#;
 
+    /// Marks a read of heap slot `slot_bit` - `VIEW_READS` and of view heap
+    /// page `page_bit` - `VIEW_PAGE_READS` in the plain shaders' bitmap, as
+    /// a translated shader reading a texture through the heap does.
+    const READ_MARK_SOURCE: &str = r#"
+#define RS "UAV(u0), RootConstants(num32BitConstants=2, b0)"
+RWByteAddressBuffer marks : register(u0);
+cbuffer c : register(b0) { uint slot_bit; uint page_bit; }
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    uint old;
+    marks.InterlockedOr((slot_bit >> 5) * 4, 1u << (slot_bit & 31), old);
+    marks.InterlockedOr((page_bit >> 5) * 4, 1u << (page_bit & 31), old);
+}
+"#;
+
+    /// Paged view heaps, through `Host::execute`: a placed texture's slot
+    /// that a shader reads in every submission, in a page taken back, reads
+    /// null in the first submission after (its page has no place) and is
+    /// made for the next. Its read in that submission is taken after it
+    /// (not cleared as forgotten), and the page's other slots made when it
+    /// is placed again leave it made.
+    #[test]
+    fn a_placed_texture_in_a_page_taken_back_is_made_after_one_submission_reads_it() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let Some((title_heap, heap_host)) = crate::host::tests::paged_view_heap(3) else {
+            return;
+        };
+        let null = std::ptr::null();
+        let page = victory_shader::emit::VIEW_PAGE_SLOTS;
+        // A 4x1 RGBA8 texture, linear, in memory of its own, viewed in page 1.
+        let memory = vec![0u8; 1 << 16];
+        let address = memory.as_ptr() as u64;
+        let words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+        let mut view = [0u32; 16];
+        view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+        let slot = page + 99;
+        let at = title_heap.start + u64::from(slot) * 32;
+        crate::descriptor::create_placed_srv(null, &words, &view, at);
+        let shader = compile_cs(READ_MARK_SOURCE);
+        let writes = crate::shadow::view_writes(false).expect("the read marks' bitmap");
+        let constants = [
+            victory_shader::emit::VIEW_READS + slot,
+            victory_shader::emit::VIEW_PAGE_READS + 1,
+        ];
+        // A submission whose shader reads the slot.
+        let read = || {
+            let list = host.new_list().unwrap();
+            // SAFETY: an open list and live objects.
+            unsafe {
+                list.list.SetComputeRootSignature(&shader.0);
+                list.list.SetComputeRootUnorderedAccessView(0, writes);
+                list.list
+                    .SetComputeRoot32BitConstants(1, 2, constants.as_ptr().cast(), 0);
+                list.list.SetPipelineState(&shader.1);
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.close();
+            host.execute(&[&list]);
+        };
+        // Read twice: the slot's read is taken and its texture made.
+        crate::shadow::forget_read(slot);
+        read();
+        read();
+        assert!(heap_host.kept(slot), "made when read");
+        crate::host::tests::without_submissions(|| {
+            crate::host::tests::take_back_all(heap_host, &mut std::time::Instant::now());
+        });
+        assert_eq!(heap_host.host_page_of(slot), Some(0), "taken back");
+        assert!(!heap_host.kept(slot), "the slot holds nothing");
+        let mut made = Vec::new();
+        for _ in 0..4 {
+            read();
+            made.push(heap_host.kept(slot));
+        }
+        assert_ne!(heap_host.host_page_of(slot), Some(0), "placed again");
+        assert_eq!(
+            made, [true; 4],
+            "made after the first submission that read it"
+        );
+    }
+
     fn buffer_at_address(address: u64, bytes: u64) -> This {
         let desc: [u32; 14] = [
             1,

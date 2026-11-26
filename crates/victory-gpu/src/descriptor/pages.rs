@@ -333,7 +333,8 @@ impl Pages {
     }
 
     /// Places page `page` if it has no place and the title has records
-    /// there (a page read after it was taken back): whether it has one now.
+    /// there (a page read or bound by a draw after it was taken back):
+    /// whether it has one now.
     pub(super) fn place(&self, page: u32) -> bool {
         let mut p = self.lock();
         let page = page as usize;
@@ -483,6 +484,21 @@ impl Pages {
     pub(super) fn set_water(&self, low: u32, high: u32) {
         let mut p = self.lock();
         (p.low, p.high) = (low, high);
+    }
+
+    /// Leaves no host page to give out (`none`), or gives back those it
+    /// held so (tests).
+    #[cfg(test)]
+    pub(super) fn hold_room(&self, none: bool) {
+        static HELD: Mutex<Option<(u32, Vec<u32>)>> = Mutex::new(None);
+        let mut p = self.lock();
+        let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+        if none {
+            *held = Some((p.next, std::mem::take(&mut p.free)));
+            p.next = self.end;
+        } else if let Some((next, free)) = held.take() {
+            (p.next, p.free) = (next, free);
+        }
     }
 }
 

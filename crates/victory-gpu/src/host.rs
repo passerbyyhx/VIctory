@@ -510,7 +510,7 @@ pub(crate) mod tests {
         let read = crate::shadow::take_page_reads();
         assert!(read.contains(&1), "its read mark");
         assert!(!crate::shadow::take_page_reads().contains(&1), "cleared");
-        crate::descriptor::turn_pages(&read, t + std::time::Duration::from_secs(1));
+        crate::descriptor::turn_pages(&read, std::time::Instant::now());
         let again = heap_host.host_page_of(slot).unwrap();
         assert_ne!(again, 0, "placed again");
         assert_eq!(heap_host.page_table_entry(1), again);
@@ -522,6 +522,183 @@ pub(crate) mod tests {
         crate::descriptor::make_read(&crate::shadow::take_reads());
         assert!(heap_host.kept(slot), "its texture made");
         eprintln!("author restoration complete: slot={slot}, original page={placed}, restored page={again}");
+    }
+
+    /// A view heap of `pages` pages of slots, if view heaps are paged here.
+    pub(crate) fn paged_view_heap(
+        pages: u32,
+    ) -> Option<(&'static crate::descriptor::Heap, &'static crate::descriptor::host::HostHeap)> {
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, pages * victory_shader::emit::VIEW_PAGE_SLOTS, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), 0);
+        let title_heap = crate::descriptor::heap(heap);
+        let heap_host = title_heap.host().expect("a host view heap");
+        if heap_host.host_page_of(0).is_none() {
+            eprintln!("view heaps are not paged here (VICTORY_VIEW_PAGES=1 pages them); skipped");
+            return None;
+        }
+        Some((title_heap, heap_host))
+    }
+
+    /// Runs `f` with no submission meanwhile.
+    pub(crate) fn without_submissions<R>(f: impl FnOnce() -> R) -> R {
+        let host = host().expect("a host GPU");
+        let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        f()
+    }
+
+    /// Takes back every page of `heap_host` unused lately: 400 submissions
+    /// a second apart from `*t` on.
+    pub(crate) fn take_back_all(heap_host: &crate::descriptor::host::HostHeap, t: &mut std::time::Instant) {
+        heap_host.set_page_water(u32::MAX, u32::MAX);
+        for _ in 0..400 {
+            *t += std::time::Duration::from_secs(1);
+            heap_host.take_back_pages(*t);
+        }
+        heap_host.set_page_water(0, 0);
+    }
+
+    /// A 64 KiB buffer at title memory of its own: the memory, the buffer.
+    fn title_buffer() -> (usize, crate::object::This) {
+        let memory = crate::watch::tests::pool(1);
+        let bytes = crate::watch::PAGE as u64;
+        let desc: [u32; 14] = [1, 0, 0, 0, bytes as u32, (bytes >> 32) as u32, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
+        let mut buffer = std::ptr::null();
+        let iid = crate::object::guid(0x696442be, 0xa72e, 0x4059, [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad]);
+        let at = memory as u64;
+        let made = crate::resource::create_at_address(std::ptr::null(), at, desc.as_ptr().cast(), 0, std::ptr::null(), &iid, &mut buffer);
+        assert_eq!(made, 0);
+        (memory, buffer)
+    }
+
+    /// Paged view heaps, in `Host::execute`'s order after a submission
+    /// (views read made, then pages turned): a placed texture's slot in a
+    /// page taken back that a shader read again is made by `make_read`,
+    /// which places the page, and stays made when `turn_pages` makes the
+    /// page's other slots from the title's records.
+    #[test]
+    fn view_heap_pages_placed_by_a_read_keep_the_texture_made_for_it() {
+        let Some(host) = host() else { return };
+        // No submission meanwhile.
+        let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((title_heap, heap_host)) = paged_view_heap(3) else { return };
+        let null = std::ptr::null();
+        let page = victory_shader::emit::VIEW_PAGE_SLOTS;
+        // A 4x1 RGBA8 texture, linear, in memory of its own, viewed in page 1.
+        let memory = vec![0u8; 1 << 16];
+        let address = memory.as_ptr() as u64;
+        let words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+        let mut view = [0u32; 16];
+        view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+        let slot = page + 77;
+        let at = title_heap.start + u64::from(slot) * 32;
+        crate::descriptor::create_placed_srv(null, &words, &view, at);
+        assert!(heap_host.mirror(slot, at, true).is_some());
+        assert!(heap_host.kept(slot), "made for the draw");
+        let mut t = std::time::Instant::now();
+        take_back_all(heap_host, &mut t);
+        assert_eq!(heap_host.host_page_of(slot), Some(0), "taken back");
+        assert!(!heap_host.kept(slot), "the slot holds nothing");
+        // A shader reads the slot (its read new to the marks), so its page.
+        crate::shadow::forget_read(slot);
+        crate::shadow::take_reads();
+        crate::shadow::tests::mark_read(false, slot);
+        crate::shadow::tests::mark_page_read(false, 1);
+        let read = crate::shadow::take_reads();
+        assert!(read.contains(&slot), "its read mark");
+        crate::descriptor::make_read(&read);
+        crate::descriptor::turn_pages(&crate::shadow::take_page_reads(), std::time::Instant::now());
+        let again = heap_host.host_page_of(slot).unwrap();
+        assert_ne!(again, 0, "placed again");
+        assert_eq!(heap_host.page_table_entry(1), again);
+        assert!(heap_host.made_from(slot, at), "made from the title's record");
+        assert!(heap_host.kept(slot), "its texture stays made");
+    }
+
+    /// Paged view heaps: buffer views (a constant buffer, a shader and an
+    /// unordered access view of a buffer) in a page taken back, their
+    /// records unchanged, are made again when a shader's read places the
+    /// page again; taken back again, a draw binding one of them places the
+    /// page at once, its views made by the heap sync before the submission.
+    #[test]
+    fn view_heap_pages_taken_back_make_their_buffer_views_again() {
+        let Some(host) = host() else { return };
+        // No submission meanwhile.
+        let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((title_heap, heap_host)) = paged_view_heap(3) else { return };
+        let null = std::ptr::null();
+        let page = victory_shader::emit::VIEW_PAGE_SLOTS;
+        let (memory, buffer) = title_buffer();
+        let (cbv, srv, uav) = (page + 1, page + 2, page + 3);
+        let at = |s: u32| title_heap.start + u64::from(s) * 32;
+        crate::descriptor::create_cbv(null, &[memory as u32, (memory as u64 >> 32) as u32, 256, 0], at(cbv));
+        // Raw views of 64 dwords.
+        let srv_desc: [u32; 10] = [39, 1, 0x1688, 0, 0, 0, 64, 0, 1, 0];
+        let uav_desc: [u32; 10] = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0];
+        crate::descriptor::create_srv(null, buffer, &srv_desc, at(srv));
+        crate::descriptor::create_uav(null, buffer, null, &uav_desc, at(uav));
+        let slots = [cbv, srv, uav];
+        for s in slots {
+            assert!(heap_host.mirror(s, at(s), true).is_some());
+            assert!(heap_host.kept(s), "slot {s} made for the draw");
+        }
+        let mut t = std::time::Instant::now();
+        take_back_all(heap_host, &mut t);
+        assert_eq!(heap_host.host_page_of(cbv), Some(0), "taken back");
+        for s in slots {
+            assert!(!heap_host.kept(s), "slot {s} holds nothing");
+            assert!(heap_host.made_from(s, at(s)), "slot {s}'s record stays noted");
+        }
+        // A shader reads the page: placed again, its views made again.
+        crate::shadow::tests::mark_page_read(false, 1);
+        crate::descriptor::turn_pages(&crate::shadow::take_page_reads(), std::time::Instant::now());
+        assert_ne!(heap_host.host_page_of(cbv), Some(0), "placed again");
+        for s in slots {
+            assert!(heap_host.kept(s), "slot {s} made again");
+        }
+        // Taken back again: a draw binding the constant buffer places it.
+        take_back_all(heap_host, &mut t);
+        assert_eq!(heap_host.host_page_of(cbv), Some(0), "taken back again");
+        assert!(heap_host.mirror(cbv, at(cbv), true).is_some());
+        let again = heap_host.host_page_of(cbv).unwrap();
+        assert_ne!(again, 0, "placed again for the draw");
+        assert_eq!(heap_host.page_table_entry(1), again);
+        // The heap sync before the submission makes the page's slots.
+        crate::descriptor::sync_heaps();
+        for s in slots {
+            assert!(heap_host.kept(s), "slot {s} made again");
+        }
+    }
+
+    /// Paged view heaps: a view written where its page found no room is
+    /// made in the scratch page and its slot holds nothing; once a shader's
+    /// read places the page, the slot is made there from the title's record.
+    #[test]
+    fn view_heap_slots_written_with_no_room_are_made_when_their_page_is_placed() {
+        let Some(host) = host() else { return };
+        // No submission meanwhile.
+        let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((title_heap, heap_host)) = paged_view_heap(3) else { return };
+        let page = victory_shader::emit::VIEW_PAGE_SLOTS;
+        let (_, buffer) = title_buffer();
+        let slot = page + 2;
+        let at = title_heap.start + u64::from(slot) * 32;
+        // A raw view of 64 dwords.
+        let desc: [u32; 10] = [39, 1, 0x1688, 0, 0, 0, 64, 0, 1, 0];
+        heap_host.hold_page_room(true);
+        crate::descriptor::create_srv(std::ptr::null(), buffer, &desc, at);
+        assert!(heap_host.mirror(slot, at, true).is_some());
+        heap_host.hold_page_room(false);
+        assert_eq!(heap_host.host_page_of(slot), Some(0), "no room for its page");
+        assert!(heap_host.made_from(slot, at), "its record noted");
+        assert!(!heap_host.kept(slot), "made in the scratch page: the slot holds nothing");
+        crate::shadow::tests::mark_page_read(false, 1);
+        crate::descriptor::turn_pages(&crate::shadow::take_page_reads(), std::time::Instant::now());
+        assert_ne!(heap_host.host_page_of(slot), Some(0), "placed");
+        assert!(heap_host.kept(slot), "made in its page");
     }
 
     /// The textures shaders read through the heap since the last eviction
@@ -1333,6 +1510,9 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        // Read marks of slots left null since the last submission: cleared
+        // before this one runs, so its reads of them are taken after it.
+        crate::shadow::forget_reads_now();
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
