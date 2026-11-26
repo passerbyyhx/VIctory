@@ -19,6 +19,9 @@ use crate::native::{
 };
 use crate::{io, ir, resource, structure};
 
+#[path = "scalar_combination_tests.rs"]
+mod scalar_combination_tests;
+
 /// User data: s0 the heap index of a structured buffer (a root constant),
 /// s1 the resource heap, s2 a table with a raw UAV. Each lane stores dword
 /// 1 of element `lane` to dword `lane` of the UAV.
