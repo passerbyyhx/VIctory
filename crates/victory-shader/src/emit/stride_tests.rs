@@ -105,6 +105,42 @@ const HEAP_CONSTANT_WAVE32: &[u32] = &[
     0xBF81_0000, // s_endpgm
 ];
 
+/// User data: s0 the heap index of a constant buffer (a root constant),
+/// s1 the resource heap, s2 a table with a raw UAV. The scalar buffer
+/// load's dynamic offset is 0xffff_fffc. An immediate of 8 makes the sum
+/// 0x1_0000_0004; a wide load at immediate 0 reaches dword zero again when
+/// its own +4 wraps in 32 bits. Both are out of bounds.
+const HEAP_CONSTANT_WRAP_WAVE32: &[u32] = &[
+    0x8F04_8500, // s_lshl_b32 s4, s0, 5
+    0xBE86_0301, // s_mov_b32 s6, s1
+    0xBE87_0380, // s_mov_b32 s7, 0
+    0xF408_0203,
+    0x0800_0000, // s_load_dwordx4 s[8:11], s[6:7], s4
+    0xBE8C_0302, // s_mov_b32 s12, s2
+    0xBE8D_0380, // s_mov_b32 s13, 0
+    0xF408_0406,
+    0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0x0
+    0x8F04_8200, // s_lshl_b32 s4, s0, 2
+    0x8085_0480, // s_sub_u32 s5, 0, s4 (0xffff_fffc for heap index 1)
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xF420_0504,
+    0x0A00_0008, // s_buffer_load_dword s20, s[8:11], s5 offset:0x8
+    0xF424_0584,
+    0x0A00_0000, // s_buffer_load_dwordx2 s[22:23], s[8:11], s5 offset:0x0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0x7E02_0214, // v_mov_b32 v1, s20
+    0x7E06_0216, // v_mov_b32 v3, s22
+    0x7E08_0217, // v_mov_b32 v4, s23
+    0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+    0xE070_1000,
+    0x8004_0102, // buffer_store_dword v1, v2, s[16:19], 0 offen
+    0xE070_1080,
+    0x8004_0302, // buffer_store_dword v3, v2, s[16:19], 0 offen offset:0x80
+    0xE070_1100,
+    0x8004_0402, // buffer_store_dword v4, v2, s[16:19], 0 offen offset:0x100
+    0xBF81_0000, // s_endpgm
+];
+
 /// User data: s0 a table with a raw SRV, s2 a table with a raw UAV. Each
 /// lane loads the half at byte `2 × lane` and stores it to dword `lane`.
 const HALF_LOAD_WAVE32: &[u32] = &[
@@ -414,6 +450,68 @@ fn a_constant_buffer_through_the_heap_reads_as_a_raw_buffer() {
             )
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
         assert_eq!(words[0], vec![9; 32], "{label}");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// A scalar buffer load's dynamic offset and immediate sum without 32-bit
+/// wrap: hardware measured on RDNA2 gives 0 for 0xffff_fffc + 8 past a small
+/// buffer, where wrapping to 4 reads its second dword; a wide load's own
+/// +4 does not wrap back to the first dword either.
+#[test]
+fn a_scalar_buffer_loads_offset_sum_does_not_wrap_in_32_bits() {
+    let shader = build(
+        HEAP_CONSTANT_WRAP_WAVE32,
+        vec![
+            param(RootType::Constants, 0),
+            param(RootType::ResourceHeap, 1),
+            param(RootType::Table, 2),
+        ],
+        vec![entry(ResourceType::Uav, 4, 2)],
+        32,
+    );
+    let data: Vec<u32> = vec![7, 8, 9, 10];
+    let views = [
+        View::RawUav(96),
+        View::Buffer {
+            data: &data,
+            stride: Stride::Raw,
+        },
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match u.root {
+                RootType::Constants => 1,
+                RootType::Table => 0,
+                other => panic!("unexpected user data {other:?}"),
+            };
+        }
+        let words = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud)), (1, Root::View { srv: true, data: vec![4, 4] })],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        assert_eq!(words[0], vec![0; 96], "{label}");
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");

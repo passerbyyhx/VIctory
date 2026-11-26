@@ -4145,14 +4145,17 @@ impl<'a> Lower<'a> {
             .ok_or("an untracked descriptor")?;
         let kind = self.used_kind(src);
         let c = self.cur;
+        let imm = *offset as u32;
         let (base, extra) = self.built_offset(src)?;
         if let Source::Built { address, bits, words } = src
             && address.param == CODE
         {
             // Descriptor around a code table; keep NUM_RECORDS per dword and
             // truncate base, imm and soffset independently as RDNA2 SMEM does.
-            let imm_al = (*offset as u32) & !3;
-            let limit = u64::from(words[0]) * u64::from((bits >> 16) & 0x3FFF).max(1);
+            let imm_al = imm & !3;
+            let records_bytes = u64::from(words[0]) * u64::from((bits >> 16) & 0x3FFF).max(1);
+            // A lane must fit the descriptor and its 32-bit offset must not wrap.
+            let limit = records_bytes.min(1u64 << 32);
             let end = u64::from(imm_al) + 4;
             let zero = self.s.m.i32(0);
             let not3 = self.s.m.i32(!3);
@@ -4194,15 +4197,41 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        let offset = &((*offset as u32).wrapping_add(base) as i32);
+        let offset = &(imm.wrapping_add(base) as i32);
+        let mut start = self.s.m.i32(imm);
         let mut addr = self.s.m.i32(*offset as u32);
+        let mut over = None;
+        if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
+            let so = self.operand(inst, soffset)?;
+            let sum = self.s.m.bin(c, Bin::Add, start, so);
+            over = Some(self.s.m.cmp(c, pred::IULT, sum, start));
+            start = sum;
+            addr = if base != 0 {
+                let b = self.s.m.i32(base);
+                self.s.m.bin(c, Bin::Add, sum, b)
+            } else {
+                sum
+            };
+        }
         if let Some(x) = extra {
             addr = self.s.m.bin(c, Bin::Add, addr, x);
         }
-        if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
-            let so = self.operand(inst, soffset)?;
-            addr = self.s.m.bin(c, Bin::Add, addr, so);
-        }
+        let guard = |s: &mut Self, k: u32, x: V| match over {
+            Some(o) => {
+                let c = s.cur;
+                let o = if k == 0 {
+                    o
+                } else {
+                    let d = s.s.m.i32(4 * k);
+                    let w = s.s.m.bin(c, Bin::Add, start, d);
+                    let r = s.s.m.cmp(c, pred::IULT, w, start);
+                    s.s.m.bin(c, Bin::Or, o, r)
+                };
+                let z = s.s.m.i32(0);
+                s.s.m.select(c, o, z, x)
+            }
+            None => x,
+        };
         // Constant data through the resource heap itself is a raw buffer: the
         // host's constant buffer views need 256-byte alignment, the title's
         // 16 (module notes, "Constant buffers in the heap").
@@ -4237,6 +4266,7 @@ impl<'a> Lower<'a> {
                 );
                 let x = self.s.m.extract(c, r, 0);
                 let x = self.as_int(x);
+                let x = guard(self, k, x);
                 self.write(inst, Reg::S(code + k as u8), x, None);
             }
             return Ok(());
@@ -4279,6 +4309,7 @@ impl<'a> Lower<'a> {
                     self.cbuffer_dword(h, a)
                 }
             };
+            let x = guard(self, k, x);
             self.write(inst, Reg::S(code + k as u8), x, None);
         }
         Ok(())
