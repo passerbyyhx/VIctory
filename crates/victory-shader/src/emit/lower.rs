@@ -21,6 +21,8 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+#[cfg(test)]
+mod buffer_store_tests;
 
 type Why = &'static str;
 
@@ -9395,9 +9397,15 @@ impl<'a> Lower<'a> {
             Some(_) => return Err(name),
         };
         // d16: two 16-bit channels per VGPR, low half first (buffer and
-        // tbuffer formats alike).
+        // tbuffer formats alike); `_d16_hi` takes the high 16-bit half.
+        let hi16 = store && (name.ends_with("_d16_hi") || name == "buffer_store_format_d16_hi_x");
         let d16 = name.contains("_format_d16_");
-        let plain = name.replace("_format_d16_", "_format_");
+        let plain = if hi16 {
+            name.replace("_format_d16_hi_", "_format_")
+                .replace("_d16_hi", "")
+        } else {
+            name.replace("_format_d16_", "_format_")
+        };
         let (typed, count) = match plain
             .strip_prefix("buffer_load_")
             .or(plain.strip_prefix("buffer_store_"))
@@ -9440,10 +9448,11 @@ impl<'a> Lower<'a> {
             let o = vaddr(self, u8::from(*idxen))?;
             off = self.s.m.bin(c, Bin::Add, off, o);
         }
-        if !matches!(
+        let has_soffset = !matches!(
             soffset,
             Operand::Scalar { code: NULL, .. } | Operand::Const(128)
-        ) {
+        );
+        if has_soffset {
             let so = self.operand(inst, soffset)?;
             off = self.s.m.bin(c, Bin::Add, off, so);
         }
@@ -9596,12 +9605,22 @@ impl<'a> Lower<'a> {
         if let (true, Some((width, _))) = (store, sub) {
             // The field of the dword holding it, by two atomics on that dword
             // (clear, then set): other lanes' fields in it are left alone.
-            // shortcut: the field is taken not to cross a dword.
-            if index.is_some() {
-                return Err("a byte or half buffer store by index");
+            // shortcut: dynamic half offsets are taken not to cross a dword;
+            // statically odd half offsets are refused here.
+            if width == 16
+                && !*offen
+                && !has_soffset
+                && extra.is_none()
+                && (u32::from(*offset) + base) & 1 != 0
+            {
+                return Err("an unaligned half buffer store");
             }
             let d = data.as_ref().ok_or("buffer store data")?;
-            let x = self.vgprs(inst, d, 1)?[0];
+            let mut x = self.vgprs(inst, d, 1)?[0];
+            if hi16 {
+                let k16 = self.s.m.i32(16);
+                x = self.s.m.bin(c, Bin::LShr, x, k16);
+            }
             let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
             let at = self.s.m.bin(c, Bin::And, off, not3);
             let byte = self.s.m.bin(c, Bin::And, off, three);
@@ -9612,15 +9631,38 @@ impl<'a> Lower<'a> {
             let mask = self.s.m.bin(c, Bin::Shl, field, sh);
             let all = self.s.m.i32(u32::MAX);
             let keep = self.s.m.bin(c, Bin::Xor, mask, all);
-            let (h, at) = self.raw_view(site, src, at, 4, (11 | 0x1000, 0), true, guard)?;
-            let begin = self.begin_guarded(guard);
+            let (h, coords, byte_at, inside) = match index {
+                Some(index) => {
+                    let stride = used.map_or(0, |u| u.stride);
+                    if stride < 4 || !stride.is_multiple_of(4) {
+                        return Err("a structured buffer of unknown stride");
+                    }
+                    let h = self.handle(site, src, false, (12 | 0x1000, stride))?;
+                    let s = self.s.m.i32(stride);
+                    let row = self.s.m.bin(self.cur, Bin::Mul, index, s);
+                    let byte_at = self.s.m.bin(self.cur, Bin::Add, row, at);
+                    // Structured UAV atomics require byte offset < stride; drop
+                    // out-of-record writes to match hardware bounds checking.
+                    let inside = self.s.m.cmp(self.cur, pred::IULT, at, s);
+                    (h, [index, at, iu], byte_at, Some(inside))
+                }
+                None => {
+                    let (h, at) = self.raw_view(site, src, at, 4, (11 | 0x1000, 0), true, guard)?;
+                    (h, [at, iu, iu], at, None)
+                }
+            };
+            let store_guard = match (guard, inside) {
+                (Some(g), Some(in_b)) => Some(self.s.m.bin(self.cur, Bin::And, g, in_b)),
+                (g, in_b) => g.or(in_b),
+            };
+            let begin = self.begin_guarded(store_guard);
             let i32t = self.s.t.i32;
             for (op, v) in [(1, keep), (2, x)] {
-                let args = [h, self.s.m.i32(op), at, iu, iu, v];
+                let args = [h, self.s.m.i32(op), coords[0], coords[1], coords[2], v];
                 self.s
                     .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args);
             }
-            self.mark_view_write(h, at, 4, None);
+            self.mark_view_write(h, byte_at, 4, None);
             self.end_guarded(begin, &[]);
             return Ok(());
         }
@@ -9644,7 +9686,7 @@ impl<'a> Lower<'a> {
                 let mut wide = Vec::new();
                 for k in 0..count {
                     let mut x = vals[(k / 2) as usize];
-                    if k % 2 == 1 {
+                    if k % 2 == 1 || hi16 {
                         let k16 = self.s.m.i32(16);
                         x = self.s.m.bin(c, Bin::LShr, x, k16);
                     }
@@ -9670,10 +9712,8 @@ impl<'a> Lower<'a> {
             // cover (for its marks).
             let (byte, bytes);
             let (op, name) = if typed {
-                // shortcut: typed stores are taken to write all four channels
-                // of a float format.
-                if count != 4 || *offen || *offset != 0 {
-                    return Err("a typed buffer store of some channels or at an offset");
+                if *offen || *offset != 0 || has_soffset || base != 0 || extra.is_some() {
+                    return Err("a typed buffer store at an offset");
                 }
                 let h = typed_h.ok_or("a typed buffer store")?;
                 let element = index.unwrap_or(self.s.m.i32(0));
@@ -9682,6 +9722,13 @@ impl<'a> Lower<'a> {
                 for x in vals {
                     args.push(self.as_float(x));
                 }
+                // DXIL typed UAV `bufferStore` requires write mask 0xF and
+                // non-undef values for all four channels; RDNA2
+                // `buffer_store_format_{x,xy,xyz}` writes the full element
+                // (not a partial read-modify-write), and hardware ignores
+                // channels past the view's format width.
+                let zero = self.s.m.f32(0);
+                args.resize(3 + 4, zero);
                 // The element's size is the view's stride (16 bytes at most).
                 (byte, bytes) = match self.s.view_index.get(&h).copied() {
                     Some(at) if self.x.view_marks => {
@@ -10926,7 +10973,7 @@ mod tests {
     };
     use crate::{io, ir, resource, structure};
 
-    const S_ENDPGM: u32 = 0xBF81_0000;
+    pub(super) const S_ENDPGM: u32 = 0xBF81_0000;
 
     /// A program's constant table starts after its instructions, unless a
     /// load at a fixed offset reads below that.
@@ -10989,7 +11036,7 @@ mod tests {
 
     /// Lowers a compute program with the root parameters `layout` (in user
     /// SGPRs from s0 on) and the used resources `used`.
-    fn lower_with(
+    pub(super) fn lower_with(
         words: &[u32],
         layout: Vec<RootParam>,
         used: Vec<UsedResource>,

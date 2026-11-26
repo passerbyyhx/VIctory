@@ -8,8 +8,9 @@
 use windows::Win32::Graphics::Direct3D12::D3D12_SAMPLER_DESC;
 
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT, DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R16G16B16A16_FLOAT,
-    DXGI_FORMAT_R16G16B16A16_UINT,
+    DXGI_FORMAT, DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R16G16_FLOAT,
+    DXGI_FORMAT_R16G16_UINT, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_UINT,
+    DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32G32_FLOAT,
 };
 
 use super::host::{Dispatch, Host, Root, Stride, View};
@@ -743,4 +744,253 @@ fn d16_x_loads_read_r16_uint_and_r16_float_views() {
             assert_eq!(words[0], want, "{label} {format:?}");
         }
     }
+}
+
+/// Partial-channel typed buffer stores (`_x`, `_xy`, `_d16_x`, `_d16_hi_x`,
+/// `_d16_xy`) write the expected bytes on hardware and WARP for both float and
+/// integer typed UAV views.
+#[test]
+fn partial_typed_buffer_stores_write_float_and_d16_views() {
+    let run_maybe_strides = |shader: &HostShader, views: &[View], strides: Vec<u32>| {
+        if !shader.root_srvs.is_empty() {
+            return run_tables(shader, views, strides);
+        }
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::new();
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {label} device; skipped");
+                continue;
+            };
+            let (root, pso) = host
+                .compute_pipeline(shader)
+                .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = 32 * u32::from(u.slot);
+            }
+            let words = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            out.push((label, words));
+        }
+        assert!(!out.is_empty(), "neither hardware nor WARP SM 6.6 device available");
+        out
+    };
+
+    // s0: typed UAV, s1: raw SRV holding input dwords (1 dword per lane).
+    let make_1dw_store = |op: u32| -> HostShader {
+        let code = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+            0xBE86_0301, // s_mov_b32 s6, s1
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xF408_0303,
+            0xFA00_0000, // s_load_dwordx4 s[12:15], s[6:7], 0x0
+            0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xE030_1000,
+            0x8003_0103, // buffer_load_dword v1, v3, s[12:15], 0 offen
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xE000_2000 | (op << 18),
+            0x8002_0100, // buffer_store_format_* v1, v0, s[8:11], 0 idxen
+            0xBF81_0000, // s_endpgm
+        ];
+        build(
+            &code,
+            vec![param(RootType::Table, 0), param(RootType::Table, 1)],
+            vec![entry(ResourceType::Uav, 4, 0), entry(ResourceType::Srv, 4, 1)],
+            32,
+        )
+    };
+
+    // 1. buffer_store_format_x -> R32_FLOAT.
+    let f32s: Vec<u32> = (0..32u32).map(|l| (l as f32 + 0.5).to_bits()).collect();
+    let views = [
+        View::TypedUav(DXGI_FORMAT_R32_FLOAT, 32, 4),
+        View::Buffer { data: &f32s, stride: Stride::Raw },
+    ];
+    for (label, words) in run_maybe_strides(&make_1dw_store(0x004), &views, vec![4, 4]) {
+        assert_eq!(words[0], f32s, "{label} R32_FLOAT format_x");
+    }
+
+    // 2. buffer_store_format_d16_xy -> R16G16_UINT and R16G16_FLOAT.
+    let u16_pairs: Vec<u32> = (0..32u32).map(|l| (0x8000 | l) | ((0xF000 | l) << 16)).collect();
+    let f16_pairs: Vec<u32> = (0..32u32).map(|l| (0x3C00 + l) | ((0x4000 + l) << 16)).collect();
+    let d16_xy = make_1dw_store(0x085);
+    for (format, stride, data) in [
+        (DXGI_FORMAT_R16G16_UINT, 4 | VIEW_INTEGER, &u16_pairs),
+        (DXGI_FORMAT_R16G16_FLOAT, 4, &f16_pairs),
+    ] {
+        let views = [
+            View::TypedUav(format, 32, 4),
+            View::Buffer { data, stride: Stride::Raw },
+        ];
+        for (label, words) in run_maybe_strides(&d16_xy, &views, vec![stride, 4]) {
+            assert_eq!(words[0], *data, "{label} {format:?} d16_xy");
+        }
+    }
+
+    // 3. buffer_store_format_d16_x (low half) & d16_hi_x (high half) -> R16_UINT & R16_FLOAT.
+    let pack = |vals: &[u32], hi: bool| -> Vec<u32> {
+        (0..16usize)
+            .map(|k| {
+                let a = if hi { vals[2 * k] >> 16 } else { vals[2 * k] & 0xFFFF };
+                let b = if hi { vals[2 * k + 1] >> 16 } else { vals[2 * k + 1] & 0xFFFF };
+                a | (b << 16)
+            })
+            .collect()
+    };
+    for (op, hi) in [(0x084u32, false), (0x027, true)] {
+        let sh = make_1dw_store(op);
+        for (format, stride, data) in [
+            (DXGI_FORMAT_R16_UINT, 2 | VIEW_INTEGER, &u16_pairs),
+            (DXGI_FORMAT_R16_FLOAT, 2, &f16_pairs),
+        ] {
+            let views = [
+                View::TypedUav(format, 32, 2),
+                View::Buffer { data, stride: Stride::Raw },
+            ];
+            let want = pack(data, hi);
+            for (label, words) in run_maybe_strides(&sh, &views, vec![stride, 4]) {
+                assert_eq!(words[0], want, "{label} {format:?} op={op:#x}");
+            }
+        }
+    }
+
+    // 4. buffer_store_format_xy -> R32G32_FLOAT (2 dwords per lane).
+    let xy_code = [
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0xF408_0303,
+        0xFA00_0000, // s_load_dwordx4 s[12:15], s[6:7], 0x0
+        0x3406_0083, // v_lshlrev_b32 v3, 3, v0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE034_1000,
+        0x8003_0103, // buffer_load_dwordx2 v[1:2], v3, s[12:15], 0 offen
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xE014_2000,
+        0x8002_0100, // buffer_store_format_xy v[1:2], v0, s[8:11], 0 idxen
+        0xBF81_0000, // s_endpgm
+    ];
+    let xy_shader = build(
+        &xy_code,
+        vec![param(RootType::Table, 0), param(RootType::Table, 1)],
+        vec![entry(ResourceType::Uav, 4, 0), entry(ResourceType::Srv, 4, 1)],
+        32,
+    );
+    let f32_pairs: Vec<u32> = (0..32u32)
+        .flat_map(|l| [(l as f32 + 1.0).to_bits(), (l as f32 * -0.25).to_bits()])
+        .collect();
+    let views = [
+        View::TypedUav(DXGI_FORMAT_R32G32_FLOAT, 32, 8),
+        View::Buffer { data: &f32_pairs, stride: Stride::Raw },
+    ];
+    for (label, words) in run_maybe_strides(&xy_shader, &views, vec![8, 4]) {
+        assert_eq!(words[0], f32_pairs, "{label} R32G32_FLOAT format_xy");
+    }
+}
+
+/// Indexed `buffer_store_{byte,short}{,_d16_hi}` write the expected sub-dword
+/// fields into a structured UAV on hardware and WARP, leave untouched bytes
+/// alone, and drop out-of-record (`offset >= stride`) writes cleanly.
+#[test]
+fn indexed_subword_buffer_stores_write_structured_uav_and_drop_oob() {
+    let code = [
+        0xBE84_0300,                   // s_mov_b32 s4, s0
+        0xBE85_0380,                   // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000,                   // s_load_dwordx4 s[8:11], s[4:5], 0x0
+        0xBE86_0301,                   // s_mov_b32 s6, s1
+        0xBE87_0380,                   // s_mov_b32 s7, 0
+        0xF408_0303,
+        0xFA00_0000,                   // s_load_dwordx4 s[12:15], s[6:7], 0x0
+        0x3406_0082,                   // v_lshlrev_b32 v3, 2, v0
+        0xBF8C_C07F,                   // s_waitcnt lgkmcnt(0)
+        0xE030_1000,
+        0x8003_0103,                   // buffer_load_dword v1, v3, s[12:15], 0 offen
+        0xBF8C_3F70,                   // s_waitcnt vmcnt(0)
+        0xE000_2000 | (0x018 << 18),
+        0x8002_0100,                   // buffer_store_byte v1, v0, s[8:11], 0 idxen offset:0
+        0xE000_2000 | (0x019 << 18) | 3,
+        0x8002_0100,                   // buffer_store_byte_d16_hi v1, v0, s[8:11], 0 idxen offset:3
+        0xE000_2000 | (0x01a << 18) | 4,
+        0x8002_0100,                   // buffer_store_short v1, v0, s[8:11], 0 idxen offset:4
+        0xE000_2000 | (0x01b << 18) | 6,
+        0x8002_0100,                   // buffer_store_short_d16_hi v1, v0, s[8:11], 0 idxen offset:6
+        0xE000_2000 | (0x018 << 18) | 8,
+        0x8002_0100,                   // buffer_store_byte v1, v0, s[8:11], 0 idxen offset:8 (OOB)
+        0xBF81_0000,                   // s_endpgm
+    ];
+    let mut uav = entry(ResourceType::Uav, 4, 0);
+    uav.stride = 8;
+    let shader = build(
+        &code,
+        vec![param(RootType::Table, 0), param(RootType::Table, 1)],
+        vec![uav, entry(ResourceType::Srv, 4, 1)],
+        32,
+    );
+    let input: Vec<u32> = (0..32u32)
+        .map(|l| (0x10 + l) | ((0x40 + l) << 8) | ((0x80 + l) << 16) | ((0xC0 + l) << 24))
+        .collect();
+    let want: Vec<u32> = input
+        .iter()
+        .flat_map(|&v| [(v & 0xFF) | (((v >> 16) & 0xFF) << 24), v])
+        .collect();
+    let views = [
+        View::StructuredUav(32, 8),
+        View::Buffer {
+            data: &input,
+            stride: Stride::Raw,
+        },
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = 32 * u32::from(u.slot);
+        }
+        let words = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        assert_eq!(words[0], want, "{label} indexed subword structured UAV");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }

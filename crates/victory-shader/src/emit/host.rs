@@ -1323,6 +1323,8 @@ pub enum View<'a> {
     /// A typed buffer UAV in this format, of this many elements of this many
     /// bytes, zeroed.
     TypedUav(DXGI_FORMAT, u32, u32),
+    /// A structured buffer UAV of this many elements of this many bytes, zeroed.
+    StructuredUav(u32, u32),
     /// A constant buffer of these dwords.
     Cbv(&'a [u32]),
     /// A buffer SRV over these dwords.
@@ -1361,7 +1363,7 @@ pub fn view_strides(views: &[View]) -> Vec<u32> {
         .map(|v| match *v {
             View::Buffer { stride: Stride::Raw, .. } | View::RawUav(_) => 4,
             View::Buffer { stride: Stride::Typed, .. } => 16,
-            View::Buffer { stride: Stride::Structured(n), .. } => n,
+            View::Buffer { stride: Stride::Structured(n), .. } | View::StructuredUav(_, n) => n,
             View::Buffer { stride: Stride::Format(f, n), .. } | View::TypedUav(f, _, n) => n | kind(f),
             View::HalfUav(_) => 8,
             _ => 0,
@@ -1682,21 +1684,40 @@ impl Host {
                         dev.CreateShaderResourceView(&tex, None, at);
                         keep.push(tex);
                     }
-                    View::RawUav(_) | View::HalfUav(_) | View::TypedUav(..) => {
-                        // (dwords, format, elements, flags)
-                        let (n, format, elements, flags) = match *v {
+                    View::RawUav(_)
+                    | View::HalfUav(_)
+                    | View::TypedUav(..)
+                    | View::StructuredUav(..) => {
+                        // (dwords, format, elements, stride, flags)
+                        let (n, format, elements, stride, flags) = match *v {
                             View::HalfUav(e) => (
                                 2 * e,
                                 DXGI_FORMAT_R16G16B16A16_FLOAT,
                                 e,
+                                0,
                                 D3D12_BUFFER_UAV_FLAG_NONE,
                             ),
-                            View::TypedUav(format, e, bytes) => {
-                                ((e * bytes).div_ceil(4), format, e, D3D12_BUFFER_UAV_FLAG_NONE)
-                            }
-                            View::RawUav(n) => {
-                                (n, DXGI_FORMAT_R32_TYPELESS, n, D3D12_BUFFER_UAV_FLAG_RAW)
-                            }
+                            View::TypedUav(format, e, bytes) => (
+                                (e * bytes).div_ceil(4),
+                                format,
+                                e,
+                                0,
+                                D3D12_BUFFER_UAV_FLAG_NONE,
+                            ),
+                            View::StructuredUav(e, stride) => (
+                                (e * stride).div_ceil(4),
+                                DXGI_FORMAT_UNKNOWN,
+                                e,
+                                stride,
+                                D3D12_BUFFER_UAV_FLAG_NONE,
+                            ),
+                            View::RawUav(n) => (
+                                n,
+                                DXGI_FORMAT_R32_TYPELESS,
+                                n,
+                                0,
+                                D3D12_BUFFER_UAV_FLAG_RAW,
+                            ),
                             _ => unreachable!(),
                         };
                         let bytes = u64::from(n) * 4;
@@ -1711,6 +1732,7 @@ impl Host {
                             Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
                                 Buffer: D3D12_BUFFER_UAV {
                                     NumElements: elements,
+                                    StructureByteStride: stride,
                                     Flags: flags,
                                     ..Default::default()
                                 },
