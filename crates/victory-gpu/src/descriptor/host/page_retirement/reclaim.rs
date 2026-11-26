@@ -163,7 +163,7 @@ pub(super) fn check(host: &Host, title_slots: u32) {
         eprintln!("translated demand for unmapped virtual slot {slot} returned {rgba:?}");
         assert_eq!(rgba, [0.; 4], "first demand before the slot was remade");
     };
-    let sample_restored = |pipeline, translated_rgba: [f32; 4], expected: [[u8; 4]; 3]| {
+    let sample_restored = |pipeline| {
         clear_output();
         // Only the translated load sets a page-read mark. The independent
         // three-color probe echoes the page table and pixels into a fresh readback.
@@ -171,8 +171,10 @@ pub(super) fn check(host: &Host, title_slots: u32) {
             record_read(list, heap, pipeline, output_slot)
         });
         host.execute(&[&list]);
-        assert_eq!(output(), translated_rgba);
-        assert_eq!(pixels.checked_colors(slots, placements()), expected);
+        let translated = output();
+        eprintln!("translated read after placement: {translated:?}");
+        let sampled = pixels.checked_colors(slots, placements());
+        (translated, sampled)
     };
 
     age(host, heap, &fillers, A, original);
@@ -185,10 +187,8 @@ pub(super) fn check(host: &Host, title_slots: u32) {
         (0, full.1, 1, 0, 1),
         "B was refused on its first write"
     );
-    sample_restored(&green, [0., 1., 0., 1.], [NULL, GREEN, BLUE]);
-    eprintln!(
-        "B={B} reused physical {original}; demand null, retry green; A/B/control=null/green/blue; counts={after_b:?}"
-    );
+    let b_readback = sample_restored(&green);
+    eprintln!("B={B} reused physical {original}; counts={after_b:?}");
 
     age(host, heap, &fillers, B, original);
     demand_missing(A, &red);
@@ -199,9 +199,18 @@ pub(super) fn check(host: &Host, title_slots: u32) {
         (0, full.1, 2, 1, 1),
         "A was resident before the allocator took it back"
     );
-    sample_restored(&red, [1., 0., 0., 1.], [RED, NULL, BLUE]);
+    let a_readback = sample_restored(&red);
     assert_eq!(heap.page_table_entry(unread / PAGE), 0);
     eprintln!(
-        "A={A} regained physical {original}; demand null, retry red; A/B/control=red/null/blue; unused slot {unread} still unmapped; counts={after_a:?}"
+        "A={A} regained physical {original}; unused slot {unread} still unmapped; counts={after_a:?}"
+    );
+    // Capture both restorations even if the first one returned the wrong color.
+    assert_eq!(
+        [b_readback, a_readback],
+        [
+            ([0., 1., 0., 1.], [NULL, GREEN, BLUE]),
+            ([1., 0., 0., 1.], [RED, NULL, BLUE]),
+        ],
+        "translated RGBA and independent A/B/control RGBA after restoring B, then A"
     );
 }

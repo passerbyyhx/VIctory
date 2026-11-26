@@ -223,7 +223,7 @@ pub(crate) fn sync_heaps() {
 /// page taken back too early reads null for the submission that read it.
 #[cfg(windows)]
 pub(crate) fn turn_pages(read: &[u32], at: std::time::Instant) {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
     for &(start, _, at_heap) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at_heap as *const Heap) };
