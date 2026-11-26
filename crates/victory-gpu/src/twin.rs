@@ -587,6 +587,10 @@ fn compile() -> windows::core::Result<Converter> {
 }
 
 #[cfg(test)]
+#[path = "twin_mixed_probe.rs"]
+mod mixed_probe;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
