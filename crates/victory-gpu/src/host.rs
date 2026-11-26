@@ -1666,14 +1666,16 @@ impl Host {
             .map(|(s, a, n, _)| (s.clone(), *a, *n))
             .collect();
         crate::shadow::copy_back_marks(&withheld, withholding);
-        // Texture views left null that shaders read: made for what follows.
+        // Snapshot the completed submission's slot marks before restoring pages.
         let read = crate::shadow::take_reads();
-        if !read.is_empty() {
-            crate::descriptor::make_read(&read);
-        }
         // Paged view heaps: pages read are kept (placed again if taken back),
         // pages unused lately taken back where room runs low.
         crate::descriptor::turn_pages(&crate::shadow::take_page_reads(), std::time::Instant::now());
+        // Page restoration leaves placed textures lazy; materialize the slots
+        // this submission read after their physical pages are ready.
+        if !read.is_empty() {
+            crate::descriptor::make_read(&read);
+        }
         for (shadow, address, len, goes_back) in &back {
             let (address, len) = (*address, *len);
             if *goes_back {

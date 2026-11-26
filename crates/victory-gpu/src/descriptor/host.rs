@@ -1139,10 +1139,6 @@ impl HostHeap {
         {
             self.set_stride(index, Some(&view));
             self.note_address(index, Some(&view));
-            if later {
-                // Made once a shader reads it (`crate::shadow::take_reads`).
-                crate::shadow::forget_read(index);
-            }
             made[index as usize] = key;
             let (kept, mark, placed) = if later {
                 (None, None, true)
@@ -1151,6 +1147,11 @@ impl HostHeap {
                 let (kept, mark) = make_marked(&view, at);
                 (kept, mark, placed)
             };
+            // A read made in scratch still needs a fresh mark on its next
+            // demand, just like a placed texture deliberately left null.
+            if later || (!placed && is_placed_texture(&view)) {
+                crate::shadow::forget_read(index);
+            }
             self.set_mark(index, mark);
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
