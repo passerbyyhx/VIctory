@@ -1135,6 +1135,18 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
 }
 
 const DEPTH: u32 = 2;
+#[cfg(all(windows, test))]
+pub(crate) fn twin_probe_desc(console: u32, deny_srv: bool) -> windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC {
+    let title = ResourceDesc {
+        dimension: 3, alignment: 0, width: 4, height: 2, depth_or_array_size: 1, mip_levels: 1,
+        format: console, sample_count: 1, sample_quality: 0, layout: 0,
+        flags: DEPTH | UNORDERED | if deny_srv { 8 } else { 0 },
+    };
+    let mapped = host_desc(&title).unwrap();
+    // The production allocator uses this same host layout.
+    unsafe { std::ptr::from_ref(&mapped).cast::<windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC>().read_unaligned() }
+}
+
 #[cfg(windows)]
 const UNORDERED: u32 = 4;
 /// Render target, depth, unordered access: what a host texture allows.

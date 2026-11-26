@@ -2026,7 +2026,7 @@ const QUADS: u32 = 19;
 const QUAD_STRIP: u32 = 20;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A root signature that indexes the heaps directly needs one of each
@@ -2444,7 +2444,7 @@ void main() {
     }
 
     /// A compute shader with its root signature inside (`RS`).
-    fn compile_cs(source: &str) -> (ID3D12RootSignature, ID3D12PipelineState) {
+    pub(crate) fn compile_cs(source: &str) -> (ID3D12RootSignature, ID3D12PipelineState) {
         let host = crate::host::host().unwrap();
         let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
         // SAFETY: the source and names outlive the call.

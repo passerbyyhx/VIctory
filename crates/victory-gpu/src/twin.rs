@@ -545,6 +545,10 @@ unsafe impl Send for Converter {}
 unsafe impl Sync for Converter {}
 
 fn converter() -> Option<&'static Converter> {
+    #[cfg(test)]
+    if mixed_probe::route_probe::missing_converter() {
+        return None;
+    }
     static MADE: std::sync::OnceLock<Option<Converter>> = std::sync::OnceLock::new();
     MADE.get_or_init(|| match compile() {
         Ok(c) => Some(c),
@@ -585,6 +589,10 @@ fn compile() -> windows::core::Result<Converter> {
         Ok(Converter { root, pso })
     }
 }
+
+#[cfg(test)]
+#[path = "twin_mixed_probe.rs"]
+mod mixed_probe;
 
 #[cfg(test)]
 mod tests {
