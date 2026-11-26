@@ -474,6 +474,11 @@ impl Pages {
     }
 
     #[cfg(test)]
+    pub(super) fn pressure_pending(&self) -> bool {
+        self.lock().pressed
+    }
+
+    #[cfg(test)]
     pub(super) fn counts(&self) -> (u32, u32, u64, u64, u64) {
         let p = self.lock();
         (

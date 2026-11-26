@@ -5,7 +5,7 @@ use super::{A, B, Host, HostHeap, PAGE, host, report_adapter, view_pages};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_TYPELESS;
 
-fn sample(host: &Host, heap: &HostHeap, index: u32) -> [f32; 4] {
+pub(super) fn sample(host: &Host, heap: &HostHeap, index: u32) -> [f32; 4] {
     let output = heap.count() + 7;
     let (buffer, data) = host.shared_buffer(16).unwrap();
     let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
