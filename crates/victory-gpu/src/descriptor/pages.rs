@@ -412,13 +412,14 @@ impl Pages {
     }
 
     #[cfg(test)]
-    pub(super) fn counts(&self) -> (u32, u32, u64, u64) {
+    pub(super) fn counts(&self) -> (u32, u32, u64, u64, u64) {
         let p = self.lock();
         (
             self.end - p.next + p.free.len() as u32,
             p.in_use(),
             p.taken_back,
             p.placed_again,
+            p.placed_late,
         )
     }
 

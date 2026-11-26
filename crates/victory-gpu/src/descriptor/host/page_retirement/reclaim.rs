@@ -14,9 +14,9 @@ fn placement(heap: &HostHeap, slot: u32) -> Option<u32> {
     (page != 0).then_some(page * PAGE + slot % PAGE)
 }
 
-/// A translated read stamped A just before the last submission ended. The next
+/// A translated read stamped the resident page in the last submission. The next
 /// submission after these 299 is the first that can make that stamp 300 old.
-fn age(host: &Host, heap: &HostHeap, fillers: &[u32], original: u32) {
+fn age(host: &Host, heap: &HostHeap, fillers: &[u32], resident: u32, original: u32) {
     let started = Instant::now();
     let empty = host.new_list().unwrap();
     empty.close();
@@ -31,12 +31,12 @@ fn age(host: &Host, heap: &HostHeap, fillers: &[u32], original: u32) {
     }
     std::thread::sleep(Duration::from_millis(10_050).saturating_sub(started.elapsed()));
     assert_eq!(
-        placement(heap, A),
+        placement(heap, resident),
         Some(original),
-        "A before the age boundary"
+        "resident slot {resident} before the age boundary"
     );
     eprintln!(
-        "299 real idle submissions in {:?}; A still at {original}",
+        "299 real idle submissions in {:?}; virtual slot {resident} still at {original}",
         started.elapsed()
     );
 }
@@ -100,8 +100,7 @@ pub(super) fn check(host: &Host, title_slots: u32) {
     }
     let full = pages.counts();
     assert_eq!(full.0, 0, "full physical heap");
-    assert_eq!(full.2, 0);
-    assert_eq!(full.3, 0);
+    assert_eq!((full.2, full.3, full.4), (0, 0, 0));
     source.write_green(B);
     // A second distinct refused page triggers the allocator's incremental
     // overflow message. It gets a title record but no shader ever requests it.
@@ -123,10 +122,10 @@ pub(super) fn check(host: &Host, title_slots: u32) {
         [RED, NULL, BLUE]
     );
     eprintln!(
-        "A={A} physical={original}; B={B} unmapped; control={control}; (free, in use, taken back, placed again)={full:?}"
+        "A={A} physical={original}; B={B} unmapped; control={control}; (free, in use, taken back, restored after take-back, restored after refusal)={full:?}"
     );
 
-    age(host, heap, &fillers, original);
+    age(host, heap, &fillers, A, original);
     clear_output();
     let (old, old_pixels) = colors.record_with(host, heap, slots, |list| {
         record_read(list, heap, &red, output_slot)
@@ -154,38 +153,55 @@ pub(super) fn check(host: &Host, title_slots: u32) {
         "gated fence {before}->{completed}; old pixels red/null/blue, marked A stays resident"
     );
 
-    age(host, heap, &fillers, original);
-    clear_output();
-    let demand = host.new_list().unwrap();
-    record_read(&demand, heap, &green, output_slot);
-    demand.close();
-    host.execute(&[&demand]);
-    let first_b = output();
-    eprintln!("translated first demand for B returned {first_b:?}");
-    assert_eq!(
-        first_b, [0.; 4],
-        "the demand read saw unmapped B before its record was remade"
-    );
+    let demand_missing = |slot, pipeline| {
+        clear_output();
+        let demand = host.new_list().unwrap();
+        record_read(&demand, heap, pipeline, output_slot);
+        demand.close();
+        host.execute(&[&demand]);
+        let rgba = output();
+        eprintln!("translated demand for unmapped virtual slot {slot} returned {rgba:?}");
+        assert_eq!(rgba, [0.; 4], "first demand before the slot was remade");
+    };
+    let sample_restored = |pipeline, translated_rgba: [f32; 4], expected: [[u8; 4]; 3]| {
+        clear_output();
+        // Only the translated load sets a page-read mark. The independent
+        // three-color probe echoes the page table and pixels into a fresh readback.
+        let (list, pixels) = colors.record_with(host, heap, slots, |list| {
+            record_read(list, heap, pipeline, output_slot)
+        });
+        host.execute(&[&list]);
+        assert_eq!(output(), translated_rgba);
+        assert_eq!(pixels.checked_colors(slots, placements()), expected);
+    };
+
+    age(host, heap, &fillers, A, original);
+    demand_missing(B, &green);
     assert_eq!(placements(), [None, Some(original), Some(control)]);
     assert_eq!(heap.page_table_entry(unread / PAGE), 0);
-    eprintln!("unsampled overflow control: virtual slot {unread} remains unmapped");
-    let final_counts = pages.counts();
+    let after_b = pages.counts();
     assert_eq!(
-        final_counts,
-        (0, full.1, 1, 1),
-        "one page returned and one lost page restored"
+        after_b,
+        (0, full.1, 1, 0, 1),
+        "B was refused on its first write"
     );
-    clear_output();
-    let (new, new_pixels) = colors.record_with(host, heap, slots, |list| {
-        record_read(list, heap, &green, output_slot)
-    });
-    host.execute(&[&new]);
-    assert_eq!(output(), [0., 1., 0., 1.]);
-    assert_eq!(
-        new_pixels.checked_colors(slots, placements()),
-        [NULL, GREEN, BLUE]
-    );
+    sample_restored(&green, [0., 1., 0., 1.], [NULL, GREEN, BLUE]);
     eprintln!(
-        "B={B} reused physical {original}; demand null, retry green; new A/B/control=null/green/blue; (free, in use, taken back, placed again)={final_counts:?}"
+        "B={B} reused physical {original}; demand null, retry green; A/B/control=null/green/blue; counts={after_b:?}"
+    );
+
+    age(host, heap, &fillers, B, original);
+    demand_missing(A, &red);
+    assert_eq!(placements(), [Some(original), None, Some(control)]);
+    let after_a = pages.counts();
+    assert_eq!(
+        after_a,
+        (0, full.1, 2, 1, 1),
+        "A was resident before the allocator took it back"
+    );
+    sample_restored(&red, [1., 0., 0., 1.], [RED, NULL, BLUE]);
+    assert_eq!(heap.page_table_entry(unread / PAGE), 0);
+    eprintln!(
+        "A={A} regained physical {original}; demand null, retry red; A/B/control=red/null/blue; unused slot {unread} still unmapped; counts={after_a:?}"
     );
 }
