@@ -901,3 +901,6 @@ mod tests {
 
 #[cfg(all(test, windows))]
 mod depth_bounds_test;
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod eight_cache_probe;
