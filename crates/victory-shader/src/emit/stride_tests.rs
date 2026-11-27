@@ -19,6 +19,8 @@ use crate::native::{
 };
 use crate::{io, ir, resource, structure};
 
+mod wave64_exchange;
+
 /// User data: s0 the heap index of a structured buffer (a root constant),
 /// s1 the resource heap, s2 a table with a raw UAV. Each lane stores dword
 /// 1 of element `lane` to dword `lane` of the UAV.
@@ -184,12 +186,16 @@ fn build(
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
+    host_shader(lower_native(&native))
+}
+
+fn lower_native(native: &NativeProgram) -> lower::Lowered {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
-    let io = io::raise(&p, &native).expect("io::raise");
-    let lowered = lower::lower(&lower::Parts {
-        native: &native,
+    let io = io::raise(&p, native).expect("io::raise");
+    lower::lower(&lower::Parts {
+        native,
         p: &p,
         st: &st,
         io: &io,
@@ -200,7 +206,10 @@ fn build(
         mesh_stride: 0,
         view_marks: false,
     })
-    .expect("lower");
+    .expect("lower")
+}
+
+fn host_shader(lowered: lower::Lowered) -> HostShader {
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
