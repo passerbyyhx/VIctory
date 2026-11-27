@@ -164,12 +164,12 @@ fn join_host_path(root: &[u16], prefix: &[u16], tail: &[u16]) -> Vec<u16> {
         out.push(0);
         return out;
     }
-    let is_verbatim = !prefix.is_empty();
-    let mut out = if is_verbatim {
-        verbatim_root(root)
-    } else {
+    let mut out = if prefix.is_empty() {
         root.to_vec()
+    } else {
+        verbatim_root(root)
     };
+    let is_verbatim = out.starts_with(&VERBATIM);
     let tail_sep = tail.first().is_some_and(|c| SEPARATORS.contains(c));
     let root_sep = out.last().is_some_and(|c| SEPARATORS.contains(c));
     if root_sep && tail_sep {
@@ -1056,6 +1056,12 @@ mod tests {
         assert_eq!(join(r"D:\", &[], r"\a\b"), r"D:\a\b");
         assert_eq!(join(r"D:\", &[], ""), r"D:\");
         assert_eq!(join(r"D:\", &[], "a"), r"D:\a");
+        assert_eq!(join(r"\\?\D:\", &[], "/a/b"), r"\\?\D:\a\b");
+        assert_eq!(join(r"\\?\C:\game", &[], "/a/b"), r"\\?\C:\game\a\b");
+        assert_eq!(
+            join(r"\\?\UNC\srv\share", &[], "/a/b"),
+            r"\\?\UNC\srv\share\a\b"
+        );
         let v = |root: &str, tail: &str| {
             let r: Vec<u16> = root.encode_utf16().collect();
             let t: Vec<u16> = tail.encode_utf16().collect();
