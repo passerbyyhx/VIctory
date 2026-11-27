@@ -12,7 +12,39 @@ use windows::Win32::Graphics::Dxgi::{
 };
 use windows::core::{GUID, Interface, PCSTR, s};
 
-fn compile_hlsl(source: &[u8], profile: PCSTR, stage: &'static str, hw: victory_shader::HwStage) -> Arc<Shader> {
+static DEBUG_ERRORS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static HEAP_PROBES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static MAKING_HEAPS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+unsafe extern "system" fn debug_message(
+    _: D3D12_MESSAGE_CATEGORY,
+    severity: D3D12_MESSAGE_SEVERITY,
+    id: D3D12_MESSAGE_ID,
+    description: PCSTR,
+    _: *mut std::ffi::c_void,
+) {
+    if severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 {
+        let description = unsafe { description.to_string() }.unwrap_or_default();
+        if id.0 == 645
+            && MAKING_HEAPS.load(std::sync::atomic::Ordering::Relaxed)
+            && description.contains("NumDescriptors 2097152")
+            && description.contains("1000000")
+        {
+            HEAP_PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            eprintln!("D3D12 setup probe {}: {description}", id.0);
+            return;
+        }
+        DEBUG_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("D3D12 error {}: {}", id.0, description);
+    }
+}
+
+fn compile_hlsl(
+    source: &[u8],
+    profile: PCSTR,
+    stage: &'static str,
+    hw: victory_shader::HwStage,
+) -> Arc<Shader> {
     let mut code: Option<ID3DBlob> = None;
     // SAFETY: `source` and `profile` are valid and `code` is the output pointer.
     unsafe {
@@ -77,7 +109,10 @@ fn made(pso: This) -> &'static host::HostPipeline {
 
 #[test]
 fn shading_rate_controls_coarse_pixel_rasterization() {
+    let debug_requested =
+        std::env::var("VICTORY_D3D12_DEBUG").as_deref() == Ok("1") && cfg!(feature = "diagnostics");
     let Some(host) = crate::host::host() else {
+        assert!(!debug_requested, "selected D3D12 host unavailable");
         eprintln!("skipped shading rate render: no host D3D12 device");
         return;
     };
@@ -89,12 +124,65 @@ fn shading_rate_controls_coarse_pixel_rasterization() {
         adapter.GetDesc1().unwrap()
     };
     let name = String::from_utf16_lossy(&adapter.Description);
-    let tier = host.shading_rate_tier.0 as u32;
+    let queue: Option<ID3D12InfoQueue1> =
+        debug_requested.then(|| device.cast().expect("active D3D12 Debug Layer"));
+    let luid = adapter.AdapterLuid;
+    let warp = std::env::var("VICTORY_D3D12_WARP").as_deref() == Ok("1");
+    assert_eq!(adapter.Flags & 2 != 0, warp);
+    let mut options6 = D3D12_FEATURE_DATA_D3D12_OPTIONS6::default();
+    let mut options10 = D3D12_FEATURE_DATA_D3D12_OPTIONS10::default();
+    let sum_query = unsafe {
+        device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS6,
+                (&raw mut options6).cast(),
+                size_of_val(&options6) as u32,
+            )
+            .unwrap();
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS10,
+            (&raw mut options10).cast(),
+            size_of_val(&options10) as u32,
+        )
+    };
+    let tier = options6.VariableShadingRateTier.0 as u32;
+    let additional = options6.AdditionalShadingRatesSupported.as_bool();
+    let sum = sum_query.is_ok() && options10.VariableRateShadingSumCombinerSupported.as_bool();
     eprintln!(
-        "shading rate on {}: tier={tier}, additional={}",
+        "shading rate on {}: tier={tier}, additional={}, tile={}, sum={sum}, options10={sum_query:?}, luid={:08x}:{:08x}, flags={:#x}, debug={}",
         name.trim_end_matches('\0'),
-        host.additional_shading_rates
+        additional,
+        options6.ShadingRateImageTileSize,
+        luid.HighPart as u32,
+        luid.LowPart,
+        adapter.Flags,
+        queue.is_some()
     );
+    let mut cookie = 0;
+    if let Some(queue) = &queue {
+        unsafe {
+            queue
+                .RegisterMessageCallback(
+                    Some(debug_message),
+                    D3D12_MESSAGE_CALLBACK_IGNORE_FILTERS,
+                    std::ptr::null_mut(),
+                    &mut cookie,
+                )
+                .unwrap();
+        }
+    }
+    let finish = || {
+        if let Some(queue) = &queue {
+            unsafe { queue.UnregisterMessageCallback(cookie).unwrap() };
+            let errors = DEBUG_ERRORS.load(std::sync::atomic::Ordering::Relaxed);
+            let probes = HEAP_PROBES.load(std::sync::atomic::Ordering::Relaxed);
+            eprintln!(
+                "D3D12 Debug Layer errors={errors}; separately recorded setup probes={probes}"
+            );
+            assert_eq!(errors, 0);
+        }
+        unsafe { device.GetDeviceRemovedReason() }.unwrap();
+    };
 
     let vs = compile_hlsl(
         b"float4 main(uint id : SV_VertexID) : SV_Position {
@@ -142,16 +230,7 @@ fn shading_rate_controls_coarse_pixel_rasterization() {
         topology: [14, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0 as u32],
         rtv: RtvFormats {
             kind: 15,
-            formats: [
-                DXGI_FORMAT_R32G32B32A32_FLOAT.0 as u32,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-            ],
+            formats: [DXGI_FORMAT_R32G32B32A32_FLOAT.0 as u32, 0, 0, 0, 0, 0, 0, 0],
             count: 1,
         },
     };
@@ -161,12 +240,41 @@ fn shading_rate_controls_coarse_pixel_rasterization() {
     };
     let null = std::ptr::null();
     let mut pso = null;
-    assert_eq!(create_stream(null, &desc, &PIPELINE_IIDS[0], &mut pso), S_OK);
-    let _ = made(pso);
+    assert_eq!(
+        create_stream(null, &desc, &PIPELINE_IIDS[0], &mut pso),
+        S_OK
+    );
+    let native_pipeline = made(pso);
 
     let mut allocator = null;
     let mut list = null;
     let iid = |g: GUID| guid(g.data1, g.data2, g.data3, g.data4);
+    let title_heap = |kind| {
+        let desc = [kind, 8u32, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        assert_eq!(
+            crate::descriptor::create_heap(
+                null,
+                desc.as_ptr().cast(),
+                &iid(ID3D12DescriptorHeap::IID),
+                &mut heap
+            ),
+            S_OK
+        );
+        heap
+    };
+    MAKING_HEAPS.store(true, std::sync::atomic::Ordering::Relaxed);
+    let title_heaps = [title_heap(0), title_heap(1)];
+    let native_heaps = title_heaps.map(|h| {
+        Some(
+            crate::descriptor::heap(h)
+                .host()
+                .expect("shader-visible heap")
+                .heap
+                .clone(),
+        )
+    });
+    MAKING_HEAPS.store(false, std::sync::atomic::Ordering::Relaxed);
     assert_eq!(
         crate::list::create_allocator(null, 0, &iid(ID3D12CommandAllocator::IID), &mut allocator),
         S_OK
@@ -183,11 +291,20 @@ fn shading_rate_controls_coarse_pixel_rasterization() {
         ),
         S_OK
     );
-    let commands = crate::list::host_list(list).unwrap();
-    let l = &commands.list;
+    let commands = || crate::list::host_list(list).unwrap();
     let newer = crate::list::has_newer_table(list);
-    let set_rate =
-        slot::<extern "system" fn(This, u32, *const u32)>(list, if newer { 0x3f0 } else { 0x3e0 });
+    let legacy = std::env::var("EIGHT_3511_PARENT").as_deref() == Ok("1");
+    let rate_slot = if newer { 0x3f0 } else { 0x3e0 };
+    let set_rate = |list, rate, combiners| {
+        if legacy {
+            slot::<extern "system" fn(This)>(list, rate_slot)(list);
+        } else {
+            slot::<extern "system" fn(This, u32, *const u32)>(list, rate_slot)(
+                list, rate, combiners,
+            );
+        }
+    };
+    eprintln!("title slot={rate_slot:#x} parent={legacy}");
     let scissors = slot::<extern "system" fn(This, u32, *const RECT)>(list, 0xb0);
     let draw = slot::<extern "system" fn(This, u32, u32, u32, u32)>(list, 0x60);
 
@@ -224,7 +341,14 @@ fn shading_rate_controls_coarse_pixel_rasterization() {
         // SAFETY: valid resource descriptions and output pointer.
         unsafe {
             device
-                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, desc, state, None, &mut result)
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    desc,
+                    state,
+                    None,
+                    &mut result,
+                )
                 .unwrap();
         }
         result.unwrap()
@@ -240,10 +364,24 @@ fn shading_rate_controls_coarse_pixel_rasterization() {
         D3D12_RESOURCE_STATE_COPY_DEST,
     );
     let rtv = host.rtv(&target, None);
+    let clear = || unsafe {
+        commands()
+            .list
+            .ClearRenderTargetView(rtv, &[-19.0; 4], None)
+    };
 
     let bind = || {
+        slot::<extern "system" fn(This, u32, *const This)>(list, 0x100)(
+            list,
+            2,
+            title_heaps.as_ptr(),
+        );
         // SAFETY: an open list and a live render-target descriptor.
-        unsafe { l.OMSetRenderTargets(1, Some(&rtv), false, None) };
+        unsafe {
+            commands()
+                .list
+                .OMSetRenderTargets(1, Some(&rtv), false, None)
+        };
         slot::<extern "system" fn(This, This)>(list, 0xc8)(list, pso);
         slot::<extern "system" fn(This, u32)>(list, 0xa0)(list, 4); // triangle list
         slot::<extern "system" fn(This, u32, *const D3D12_VIEWPORT)>(list, 0xa8)(
@@ -271,6 +409,7 @@ fn shading_rate_controls_coarse_pixel_rasterization() {
         draw(list, 3, 1, 0, 0);
     };
     let read_target = || -> [[[f32; 4]; 4]; 4] {
+        let l = &commands().list;
         let mut from = D3D12_TEXTURE_COPY_LOCATION {
             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
             ..Default::default()
@@ -311,7 +450,8 @@ fn shading_rate_controls_coarse_pixel_rasterization() {
             slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
             S_OK
         );
-        host.execute(&[commands]);
+        let segments = crate::list::segments(list);
+        host.execute(&segments.iter().map(Arc::as_ref).collect::<Vec<_>>());
         let mut mapped = std::ptr::null_mut();
         let mut rows = [[[0.0f32; 4]; 4]; 4];
         // SAFETY: GPU copy completed; buffer has 4 rows at 256-byte stride.
@@ -327,7 +467,11 @@ fn shading_rate_controls_coarse_pixel_rasterization() {
                 )
                 .unwrap();
             for (y, row) in rows.iter_mut().enumerate() {
-                *row = mapped.cast::<u8>().add(y * 256).cast::<[[f32; 4]; 4]>().read();
+                *row = mapped
+                    .cast::<u8>()
+                    .add(y * 256)
+                    .cast::<[[f32; 4]; 4]>()
+                    .read();
             }
             readback.Unmap(0, Some(&D3D12_RANGE::default()));
         }
@@ -335,6 +479,7 @@ fn shading_rate_controls_coarse_pixel_rasterization() {
     };
 
     bind();
+    clear();
     // Top-left (0..2, 0..2): fresh list defaults to 1x1.
     draw_quad(0, 0);
     // Top-right (2..4, 0..2): 2x2 with null combiners.
@@ -350,6 +495,36 @@ fn shading_rate_controls_coarse_pixel_rasterization() {
     // Leave a coarse rate active before reset to verify Reset restores 1x1.
     set_rate(list, 0x5, std::ptr::null());
     let pass1 = read_target();
+    eprintln!("fresh, 2x2, 2x1, 1x2 quadrants: {pass1:?}");
+
+    let check_pixels = |case: &str, rows: [[[f32; 4]; 4]; 4], x_rate: usize, y_rate: usize| {
+        eprintln!("{case}: expected {x_rate}x{y_rate}, actual {rows:?}");
+        for (y, row) in rows.iter().enumerate() {
+            for (x, px) in row.iter().enumerate() {
+                assert_eq!([px[2], px[3]], [0.0, 1.0], "{case}: draw pixel ({x},{y})");
+                for (oy, other) in rows.iter().enumerate() {
+                    for (ox, opx) in other.iter().enumerate() {
+                        assert_eq!(
+                            px == opx,
+                            x / x_rate == ox / x_rate && y / y_rate == oy / y_rate,
+                            "{case}: shading groups ({x},{y}) vs ({ox},{oy})"
+                        );
+                    }
+                }
+            }
+        }
+    };
+    if legacy {
+        check_pixels("parent: title shading-rate slot is a no-op", pass1, 1, 1);
+        finish();
+        for object in [list, allocator, pso, title_heaps[0], title_heaps[1]] {
+            assert_eq!(
+                slot::<extern "system" fn(This) -> u32>(object, 0x10)(object),
+                0
+            );
+        }
+        return;
+    }
 
     // Fresh list 1x1 quadrant: every pixel has a distinct SV_Position.
     assert_ne!(pass1[0][0][0], pass1[0][1][0], "fresh 1x1 must separate X");
@@ -362,11 +537,17 @@ fn shading_rate_controls_coarse_pixel_rasterization() {
         assert_eq!(pass1[0][2], pass1[1][3], "2x2 must broadcast across block");
         // 2x1: horizontal pairs match, rows remain distinct.
         assert_eq!(pass1[2][0][0], pass1[2][1][0], "2x1 must broadcast X");
-        assert_eq!(pass1[3][0][0], pass1[3][1][0], "2x1 must broadcast X on row 3");
+        assert_eq!(
+            pass1[3][0][0], pass1[3][1][0],
+            "2x1 must broadcast X on row 3"
+        );
         assert_ne!(pass1[2][0][1], pass1[3][0][1], "2x1 must keep Y distinct");
         // 1x2: vertical pairs match, columns remain distinct.
         assert_eq!(pass1[2][2][1], pass1[3][2][1], "1x2 must broadcast Y");
-        assert_eq!(pass1[2][3][1], pass1[3][3][1], "1x2 must broadcast Y on col 3");
+        assert_eq!(
+            pass1[2][3][1], pass1[3][3][1],
+            "1x2 must broadcast Y on col 3"
+        );
         assert_ne!(pass1[2][2][0], pass1[2][3][0], "1x2 must keep X distinct");
     } else {
         // Tier 0 ignores RSSetShadingRate cleanly and rasterizes at 1x1.
@@ -380,6 +561,7 @@ fn shading_rate_controls_coarse_pixel_rasterization() {
         S_OK
     );
     bind();
+    clear();
     // Top-left (0..2, 0..2): right after Reset, must be 1x1.
     draw_quad(0, 0);
     // Top-right (2..4, 0..2): invalid base rate (0x7) must fall back to 1x1
@@ -392,6 +574,7 @@ fn shading_rate_controls_coarse_pixel_rasterization() {
     set_rate(list, 0x5, non_passthrough.as_ptr());
     draw_quad(0, 2);
     let pass2 = read_target();
+    eprintln!("reset, invalid rate, max-combiner quadrants: {pass2:?}");
 
     assert_ne!(pass2[0][0][0], pass2[0][1][0], "reset must restore 1x1 X");
     assert_ne!(pass2[0][0][1], pass2[1][0][1], "reset must restore 1x1 Y");
@@ -414,7 +597,7 @@ fn shading_rate_controls_coarse_pixel_rasterization() {
 
     // When the adapter advertises AdditionalShadingRatesSupported, 4x4 (0xA)
     // must broadcast one coarse PS invocation across the full 4x4 target.
-    if tier >= 1 && host.additional_shading_rates {
+    if tier >= 1 && additional {
         assert_eq!(
             slot::<extern "system" fn(This, This, This) -> HRESULT>(list, 0x50)(
                 list, allocator, null
@@ -422,6 +605,7 @@ fn shading_rate_controls_coarse_pixel_rasterization() {
             S_OK
         );
         bind();
+        clear();
         set_rate(list, 0xA, std::ptr::null());
         scissors(
             list,
@@ -435,14 +619,127 @@ fn shading_rate_controls_coarse_pixel_rasterization() {
         );
         draw(list, 3, 1, 0, 0);
         let pass3 = read_target();
+        check_pixels("author 4x4", pass3, 4, 4);
         for row in &pass3 {
             for px in row {
-                assert_eq!(*px, pass3[0][0], "4x4 must broadcast across the entire 4x4 block");
+                assert_eq!(
+                    *px, pass3[0][0],
+                    "4x4 must broadcast across the entire 4x4 block"
+                );
             }
         }
     }
 
-    for object in [list, allocator, pso] {
-        assert_eq!(slot::<extern "system" fn(This) -> u32>(object, 0x10)(object), 0);
+    let reset = || {
+        assert_eq!(
+            slot::<extern "system" fn(This, This, This) -> HRESULT>(list, 0x50)(
+                list, allocator, null
+            ),
+            S_OK
+        );
+    };
+    let full = || {
+        scissors(
+            list,
+            1,
+            &RECT {
+                left: 0,
+                top: 0,
+                right: 4,
+                bottom: 4,
+            },
+        )
+    };
+    let begin = || {
+        reset();
+        bind();
+        clear();
+        full();
+    };
+    let verify = |label, x, y| check_pixels(label, read_target(), x, y);
+
+    if tier >= 1 {
+        let coarse = |combiners: [u32; 2]| set_rate(list, 0x5, combiners.as_ptr());
+        for (label, combiners, on_tier2) in [
+            ("MAX image", [0, 3], 2),
+            ("MIN primitive (default source 1x1)", [2, 0], 1),
+            ("MIN image (default source 1x1)", [0, 2], 1),
+            ("OVERRIDE image (default source 1x1)", [0, 1], 1),
+            (
+                "invalid image combiner falls back to passthrough",
+                [0, 99],
+                2,
+            ),
+        ] {
+            begin();
+            coarse(combiners);
+            draw(list, 3, 1, 0, 0);
+            let rate = if tier >= 2 { on_tier2 } else { 2 };
+            verify(label, rate, rate);
+        }
+        if tier >= 2 && sum {
+            begin();
+            coarse([4, 4]);
+            draw(list, 3, 1, 0, 0);
+            verify("SUM with default 1x1 sources", 2, 2);
+        }
+
+        // The wait path closes the first segment and calls State::cut. Bind
+        // only native PSO/RTV/root on the next list so State::bind cannot
+        // reapply the rate and hide a missing cut replay. No guest wait is
+        // needed here because Host::execute submits the recorded segments.
+        begin();
+        set_rate(list, 0x4, null.cast::<u32>());
+        draw(list, 3, 1, 0, 0);
+        clear();
+        assert_eq!(crate::list::segments(list).len(), 1);
+        crate::list::wait64(list, 0, 0, 0, 0);
+        assert_eq!(crate::list::segments(list).len(), 2);
+        unsafe {
+            let l = &commands().list;
+            l.SetDescriptorHeaps(&native_heaps);
+            l.SetPipelineState(&native_pipeline.pso);
+            l.SetGraphicsRootSignature(&native_pipeline.root);
+            l.OMSetRenderTargets(1, Some(&rtv), false, None);
+            l.DrawInstanced(3, 1, 0, 0);
+        }
+        verify("wait split: cut replay isolated from State::bind", 2, 1);
+
+        // A native 1x1 perturbation leaves the title's tracked 2x2 untouched.
+        // With or without the rebind notification, the same title draw runs.
+        // The paired control ensures 2x2 actually depends on production replay.
+        for replay in [false, true] {
+            begin();
+            coarse([0, 0]);
+            draw(list, 3, 1, 0, 0);
+            clear();
+            let cmd: ID3D12GraphicsCommandList5 = commands().list.cast().unwrap();
+            unsafe { cmd.RSSetShadingRate(D3D12_SHADING_RATE_1X1, None) };
+            if replay {
+                commands().need_rebind();
+            }
+            draw(list, 3, 1, 0, 0);
+            let rate = if replay { 2 } else { 1 };
+            verify(
+                if replay {
+                    "graphics PSO rebind replay"
+                } else {
+                    "rebind negative control"
+                },
+                rate,
+                rate,
+            );
+        }
+        begin();
+        draw(list, 3, 1, 0, 0);
+        verify("title Reset restores 1x1 after rebind", 1, 1);
+    }
+
+    finish();
+    for object in [list, allocator, pso, title_heaps[0], title_heaps[1]] {
+        assert_eq!(
+            slot::<extern "system" fn(This) -> u32>(object, 0x10)(object),
+            0
+        );
     }
 }
