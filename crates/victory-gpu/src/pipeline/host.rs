@@ -1056,7 +1056,38 @@ where
     // every time: the host's pipeline library tells a stored pipeline
     // from a new one by the bytes of the description, padding included.
     let padding = stream_padding(&stream);
+    #[cfg(test)]
+    let probe = std::env::var("EIGHT_CACHE_POISON").ok().map(|value| {
+        let poison = u8::from_str_radix(&value, 16).expect("hex padding byte");
+        let bytes = (&raw mut stream).cast::<u8>();
+        // SAFETY: these ranges are within the stream and contain no fields.
+        unsafe {
+            for range in padding.iter().filter(|range| !range.is_empty()) {
+                bytes.add(range.start).write_bytes(poison, range.len());
+            }
+        }
+        let bypass = std::env::var_os("EIGHT_CACHE_RAW_PADDING").is_some();
+        (poison, bypass)
+    });
+    #[cfg(not(test))]
     zero_padding(&mut stream, &padding);
+    #[cfg(test)]
+    if !probe.is_some_and(|(_, bypass)| bypass) {
+        zero_padding(&mut stream, &padding);
+    }
+    #[cfg(test)]
+    if let Some((poison, bypass)) = probe {
+        let bytes = (&raw const stream).cast::<u8>();
+        let count = padding.iter().map(|range| range.len()).sum::<usize>();
+        assert!(count > 0);
+        let expected = if bypass { poison } else { 0 };
+        // SAFETY: the disjoint ranges were initialized above and stay in place.
+        for i in padding.iter().flat_map(|range| range.clone()) {
+            assert_eq!(unsafe { bytes.add(i).read() }, expected);
+        }
+        eprintln!("stream={} padding_bytes={count} poison={poison:02x} submitted={expected:02x} bypass={bypass}", size_of_val(&stream));
+    }
+
     let desc = D3D12_PIPELINE_STATE_STREAM_DESC {
         SizeInBytes: size_of_val(&stream),
         pPipelineStateSubobjectStream: (&raw mut stream).cast(),
@@ -1065,9 +1096,23 @@ where
     super::library::pipeline(
         name,
         // SAFETY: the stream holds whole subobjects pointing at live data.
-        |library, name| unsafe { library.LoadPipeline(name, &desc) },
+        |library, name| {
+            let result = unsafe { library.LoadPipeline(name, &desc) };
+            #[cfg(test)]
+            if probe.is_some() {
+                eprintln!("LoadPipeline={:?}", result.as_ref().err().map(|e| e.code()));
+            }
+            result
+        },
         // SAFETY: as above.
-        || unsafe { device.CreatePipelineState(&desc) },
+        || {
+            let result = unsafe { device.CreatePipelineState(&desc) };
+            #[cfg(test)]
+            if probe.is_some() {
+                eprintln!("CreatePipelineState={:?}", result.as_ref().err().map(|e| e.code()));
+            }
+            result
+        },
     )
 }
 
