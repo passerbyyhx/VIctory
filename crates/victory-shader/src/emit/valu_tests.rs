@@ -1766,7 +1766,8 @@ fn user_data_cs32(shader: &HostShader, k: u32) -> Vec<u32> {
 
 #[test]
 fn gradient_samples_apply_the_offset_at_the_clamped_mip() {
-    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::{Direct3D12::*, Dxgi::*};
+    use windows::core::Interface;
 
     let mut prefix = vec![s_mov_b32(5, 0x80), s_mov_b32(7, 0x80)];
     for (op, dst, base, offset) in [(3u32, 8u32, 4u32, 0u32), (2, 20, 4, 0x20), (2, 16, 6, 0)] {
@@ -1780,17 +1781,17 @@ fn gradient_samples_apply_the_offset_at_the_clamped_mip() {
         (4, ResourceType::Uav, 8, 4),
         (6, ResourceType::Sampler, 0, 4),
     ];
-    let sample = |offset| {
+    let sample = |offset, gradient: f32, uv: [f32; 2]| {
         let mut words = prefix.clone();
         words.extend([vop1(0x001, 1, 255), offset]);
-        // Two 1/16 gradients select mip 0, unless the clamp in s0 raises it.
+        // The axis gradients select mip 0, unless the clamp in s0 raises it.
         for (reg, value) in [
-            (2, 1.0 / 16.0f32),
+            (2, gradient),
             (3, 0.0),
             (4, 0.0),
-            (5, 1.0 / 16.0),
-            (6, 11.0 / 32.0),
-            (7, 19.0 / 32.0),
+            (5, gradient),
+            (6, uv[0]),
+            (7, uv[1]),
         ] {
             words.extend([vop1(0x001, reg, 255), value.to_bits()]);
         }
@@ -1804,8 +1805,9 @@ fn gradient_samples_apply_the_offset_at_the_clamped_mip() {
         words.push(S_ENDPGM);
         lower_cs32(&words, &used, true)
     };
-    let plain = sample(0);
-    let shifted = sample(0x3F01); // x = 1, y = -1 in signed six-bit fields
+    let uv = [11.0 / 32.0, 19.0 / 32.0];
+    let plain = sample(0, 1.0 / 16.0, uv);
+    let shifted = sample(0x3F01, 1.0 / 16.0, uv); // x = 1, y = -1
     let mut texels = Vec::new();
     for level in 0..5 {
         let width = 16 >> level;
@@ -1825,20 +1827,75 @@ fn gradient_samples_apply_the_offset_at_the_clamped_mip() {
         MaxLOD: f32::MAX,
         ..Default::default()
     }];
+    // Keep gradients, UV and texture binding fixed across all independent cases.
+    // At mip 1 the base texel is (12, 18), well inside the 32x32 footprint
+    // after either endpoint is applied. Edge clamping cannot hide a bad sign.
+    let uv = [25.5 / 64.0, 37.5 / 64.0];
+    let wide_plain = sample(0, 1.0 / 64.0, uv);
+    let wide_a = sample(0x0738, 1.0 / 64.0, uv); // x = -8, y = +7
+    let wide_b = sample(0x3807, 1.0 / 64.0, uv); // x = +7, y = -8
+    let mut wide_texels = Vec::new();
+    for level in 0..3 {
+        let width = 64 >> level;
+        for y in 0..width {
+            for x in 0..width {
+                wide_texels.push([(level * 10_000 + y * 128 + x + 1) as f32, 0.0, 0.0, 1.0]);
+            }
+        }
+    }
+    let wide = [View::Mipped(64, 64, 3, &wide_texels), View::RawUav(32)];
     let cases = [
-        (&plain, 0.0f32, 294.0f32), // mip 0 (5, 9)
-        (&shifted, 0.0, 263.0),     // mip 0 (6, 8)
-        (&plain, 2.0, 2066.0),      // mip 2 (1, 2)
-        (&shifted, 2.0, 2035.0),    // mip 2 (2, 1)
+        ("author 0/0", &plain, &views, 0.0f32, 294.0f32), // mip 0 (5, 9)
+        ("author 1/-1", &shifted, &views, 0.0, 263.0),      // mip 0 (6, 8)
+        ("author 0/0", &plain, &views, 2.0, 2066.0),        // mip 2 (1, 2)
+        ("author 1/-1", &shifted, &views, 2.0, 2035.0),     // mip 2 (2, 1)
+        ("independent 0/0", &wide_plain, &wide, 0.0, 4762.0), // mip 0 (25, 37)
+        ("independent 0/0", &wide_plain, &wide, 1.0, 12317.0), // mip 1 (12, 18)
+        ("independent -8/+7", &wide_a, &wide, 0.0, 5650.0), // mip 0 (17, 44)
+        ("independent -8/+7", &wide_a, &wide, 1.0, 13205.0), // mip 1 (4, 25)
+        ("independent +7/-8", &wide_b, &wide, 0.0, 3745.0), // mip 0 (32, 29)
+        ("independent +7/-8", &wide_b, &wide, 1.0, 11300.0), // mip 1 (19, 10)
     ];
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let backend = std::env::var("EIGHT_3493_ADAPTER").ok();
+    assert!(matches!(backend.as_deref(), None | Some("hardware" | "warp")));
+    if backend.is_some() {
+        let mut debug: Option<ID3D12Debug> = None;
+        unsafe {
+            D3D12GetDebugInterface(&mut debug).expect("D3D12 Debug Layer");
+            debug.unwrap().EnableDebugLayer();
+        }
+    }
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
+        if backend.as_deref().is_some_and(|selected| label != selected) {
             continue;
+        }
+        let host = match Host::new(warp) {
+            Ok(host) => host,
+            Err(error) if backend.is_none() => {
+                eprintln!("no SM 6.6 {label} device; skipped: {error}");
+                continue;
+            }
+            Err(error) => panic!("selected SM 6.6 device: {error}"),
         };
-        for (shader, clamp, want) in cases {
+        let queue: Option<ID3D12InfoQueue> = if backend.is_some() {
+            Some(host.device.cast().expect("debug queue"))
+        } else {
+            None
+        };
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(host.device.GetAdapterLuid()).unwrap();
+            let desc = adapter.GetDesc1().unwrap();
+            let name = String::from_utf16_lossy(&desc.Description);
+            let luid = desc.AdapterLuid;
+            assert_eq!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0, warp);
+            eprintln!("adapter={:?} luid={:08x}:{:08x} flags={:#x} debug={}",
+                name.trim_end_matches('\0'), luid.HighPart as u32, luid.LowPart, desc.Flags,
+                queue.is_some());
+        }
+        for (case, shader, views, clamp, want) in cases {
             let (root, pso) = host.compute_pipeline(shader).expect("sample pipeline");
             let out = host
                 .dispatch(
@@ -1846,17 +1903,44 @@ fn gradient_samples_apply_the_offset_at_the_clamped_mip() {
                     &pso,
                     &Dispatch {
                         roots: vec![(0, Root::Constants(user_data_cs32(shader, clamp.to_bits())))],
-                        views: &views,
+                        views,
                         samplers: &samplers,
                         groups: [1, 1, 1],
                     },
                 )
                 .expect("sample dispatch");
-            assert_eq!(out[0], [want.to_bits(); 32], "{label}: clamp {clamp}");
+            eprintln!("{label} {case} clamp={clamp} expected={} actual={:?}",
+                want, out[0].iter().map(|&lane| f32::from_bits(lane) as u32).collect::<Vec<_>>());
+            assert_eq!(out[0], [want.to_bits(); 32], "{label}: {case} clamp {clamp}");
             ran += 1;
         }
+        let Some(queue) = queue else { continue };
+        let count = unsafe { queue.GetNumStoredMessages() };
+        let mut errors = 0;
+        for index in 0..count {
+            let mut bytes = 0;
+            unsafe { queue.GetMessage(index, None, &mut bytes) }.unwrap();
+            let mut storage = vec![0u64; bytes.div_ceil(8)];
+            let message = storage.as_mut_ptr().cast::<D3D12_MESSAGE>();
+            unsafe { queue.GetMessage(index, Some(message), &mut bytes) }.unwrap();
+            let message = unsafe { &*message };
+            if message.Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 {
+                errors += 1;
+                let description = unsafe {
+                    std::slice::from_raw_parts(message.pDescription, message.DescriptionByteLength)
+                };
+                eprintln!("D3D12 error {}: {}", message.ID.0, String::from_utf8_lossy(description));
+            }
+        }
+        eprintln!("debug messages={count} errors={errors}");
+        assert_eq!(errors, 0);
+        unsafe { host.device.GetDeviceRemovedReason() }.unwrap();
     }
-    assert!(ran > 0, "no device ran the gradient sample");
+    if backend.is_some() {
+        assert_eq!(ran, cases.len(), "every selected-adapter case must run");
+    } else {
+        assert!(ran > 0, "no device ran the gradient sample");
+    }
 }
 
 /// Image addresses with `a16` after a whole-VGPR operand (the offset or
