@@ -923,7 +923,7 @@ fn partial_dmask_image_stores_write_typed_texture_uavs() {
 
     // Seed every channel before a sparse store. The unselected channels
     // must become zero, and Alpha is discarded by a two-channel view.
-    let rw_code = [
+    let seed_rgba = [
         0xBE84_0300, // s_mov_b32 s4, s0
         0xBE85_0380, // s_mov_b32 s5, 0
         0xF40C_0202,
@@ -938,6 +938,9 @@ fn partial_dmask_image_stores_write_typed_texture_uavs() {
         0xF020_1F08,
         0x0002_0105, // image_store v[1:4], v[5:6], dmask:0xF
         0xBF8C_0000,
+    ];
+    let mut rw_code = seed_rgba.to_vec();
+    rw_code.extend([
         0x7E02_02FF,
         0x4180_0000, // v_mov_b32 v1, 16.0
         0x7E04_02FF,
@@ -945,7 +948,7 @@ fn partial_dmask_image_stores_write_typed_texture_uavs() {
         0xF020_1908,
         0x0002_0105, // image_store v[1:2], v[5:6], dmask:0x9
         0xBF81_0000,
-    ];
+    ]);
     let shader = build(
         &rw_code,
         vec![param(RootType::Table, 0)],
@@ -962,6 +965,44 @@ fn partial_dmask_image_stores_write_typed_texture_uavs() {
         let want: Vec<_> = texel.iter().map(|x| x.to_bits()).collect();
         for (label, words) in run(&shader, &[view], vec![0]) {
             assert_eq!(words[0], want.repeat(32), "{label} dmask=0x9 whole texel");
+        }
+    }
+
+    // Compare the same seeded RGBA16F texels before and after each d16 store.
+    // The second store offers packed R=5 and B=12. The seed is (0.5, 1, 2, 4).
+    for (mask, want) in [
+        (None, [0x3c00_3800, 0x4400_4000]),
+        (Some(0u32), [0x3c00_3800, 0x4400_4000]),
+        (Some(5u32), [0x0000_4500, 0x0000_4a00]),
+    ] {
+        let mut code = seed_rgba.to_vec();
+        if let Some(mask) = mask {
+            code.extend([
+                0x7E02_02FF,
+                0x4a00_4500, // v_mov_b32 v1, packed halves
+                0xF020_1008 | (mask << 8),
+                0x8002_0105, // image_store d16 v1, v[5:6]
+            ]);
+        }
+        code.push(0xBF81_0000); // s_endpgm
+        let shader = build(
+            &code,
+            vec![param(RootType::Table, 0)],
+            vec![entry(ResourceType::Uav, 8, 0)],
+            32,
+        );
+        let views = [View::TypedTextureUav(
+            DXGI_FORMAT_R16G16B16A16_FLOAT,
+            32,
+            1,
+            2,
+        )];
+        for (label, words) in run(&shader, &views, vec![0]) {
+            assert_eq!(words[0], want.repeat(32), "{label} RGBA16F mask={mask:?}");
+            eprintln!(
+                "{label} RGBA16F mask={mask:?} texels=32 first={:08x?}",
+                &words[0][..2]
+            );
         }
     }
 
