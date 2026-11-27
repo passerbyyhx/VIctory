@@ -3336,3 +3336,7 @@ mod tests {
         assert!(takes(&tex115, &hd115));
     }
 }
+
+#[cfg(all(windows, test, feature = "diagnostics"))]
+#[path = "carrier_render_probe.rs"]
+mod carrier_render_probe;
