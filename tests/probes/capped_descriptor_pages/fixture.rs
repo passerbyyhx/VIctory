@@ -2,6 +2,8 @@
     #[test]
     fn capped_heap_page_scan_and_last_texel() {
         let host = crate::host::host().expect("D3D12 device");
+        let luid = unsafe { host.device.GetAdapterLuid() };
+        println!("adapter_luid={:08x}:{:08x}",luid.HighPart,luid.LowPart);
         let natural = std::env::var_os("VICTORY_PROBE_NATURAL").is_some();
         let parent = std::env::var_os("VICTORY_PROBE_PARENT").is_some();
         let title = if natural { 1_245_184u32 } else { 8192u32 };
