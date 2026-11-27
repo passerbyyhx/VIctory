@@ -17,6 +17,10 @@ use windows::core::{Interface, PCSTR};
 use super::{Shader, Translated};
 use crate::host::host;
 
+#[cfg(all(test, feature = "diagnostics"))]
+#[path = "integer_blend_probe.rs"]
+mod integer_blend_probe;
+
 /// A stream's graphics state, owned (the title's stream lives only for the
 /// creation call). Subobjects the stream leaves out keep D3D12's defaults.
 pub(crate) struct GraphicsState {
